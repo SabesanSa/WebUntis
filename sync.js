@@ -44,21 +44,19 @@ async function fetchTimetable() {
   const page = await context.newPage();
 
   try {
+    // 1. IServ Login
     console.log("🔐 IServ Login...");
     await page.goto(ISERV_URL + "/login", { waitUntil: "domcontentloaded", timeout: 30000 });
-    
-    // Felder ausfüllen
     await page.fill('input[name="_username"]', ISERV_USER);
     await page.fill('input[name="_password"]', ISERV_PASS);
-    
-    // Submit und auf URL-Änderung warten statt Navigation
     await Promise.all([
       page.waitForURL("**/iserv/**", { timeout: 30000 }),
       page.click('button[type="submit"]'),
     ]);
+    console.log("✅ Eingeloggt");
 
-    console.log("✅ Eingeloggt, aktuelle URL:", page.url());
-
+    // 2. WebUntis direkt aufrufen (neue Seite, eigene Domain)
+    const wuPage = await context.newPage();
     const allLessons = [];
 
     for (const offset of [0, 1]) {
@@ -66,21 +64,29 @@ async function fetchTimetable() {
       const dateStr = toISODate(monday);
       const apiUrl = `https://wkdo.webuntis.com/WebUntis/api/public/timetable/weekly/student?elementId=5697&date=${dateStr}&formatId=1`;
 
-      const response = await page.evaluate(async (url) => {
-        try {
-          const res = await fetch(url, { credentials: "include" });
-          return { ok: res.ok, status: res.status, body: await res.text() };
-        } catch (e) {
-          return { ok: false, status: 0, body: e.message };
-        }
-      }, apiUrl);
+      console.log(`📡 Lade ${apiUrl}`);
 
-      if (!response.ok) {
-        console.warn(`⚠️ API ${dateStr}: ${response.status} - ${response.body.slice(0, 100)}`);
+      // Direkt zur API-URL navigieren
+      const response = await wuPage.goto(apiUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
+
+      if (!response || !response.ok()) {
+        console.warn(`⚠️ API ${dateStr}: Status ${response?.status()}`);
         continue;
       }
 
-      const json = JSON.parse(response.body);
+      const body = await wuPage.content();
+      // JSON aus dem <pre> oder body-Tag extrahieren
+      const match = body.match(/<pre[^>]*>([\s\S]*?)<\/pre>/) || body.match(/<body[^>]*>([\s\S]*?)<\/body>/);
+      const jsonStr = match ? match[1].trim() : await response.text();
+
+      let json;
+      try {
+        json = JSON.parse(jsonStr);
+      } catch {
+        console.warn(`⚠️ JSON-Parsing fehlgeschlagen für ${dateStr}`);
+        continue;
+      }
+
       const data = json?.data ?? json;
       const days = data?.days ?? data?.weeks?.[0]?.days ?? [];
 
