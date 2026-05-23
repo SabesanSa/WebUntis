@@ -1,9 +1,3 @@
-/**
- * WebUntis → Notion Sync
- * Login via IServ → WebUntis
- * Schule: Westfalen Kolleg Dortmund
- */
-
 const { chromium } = require("playwright");
 const { Client } = require("@notionhq/client");
 
@@ -12,9 +6,6 @@ const DATABASE_ID = process.env.NOTION_DATABASE_ID;
 const ISERV_URL = "https://westfalenkolleg-dortmund-edu.de/iserv";
 const ISERV_USER = process.env.ISERV_USER;
 const ISERV_PASS = process.env.ISERV_PASS;
-const WEBUNTIS_URL = "https://wkdo.webuntis.com/WebUntis?school=wkdo#/basic/timetablePublic/my-student";
-
-// ─── Hilfsfunktionen ────────────────────────────────────────────────────────
 
 function parseTime(timeInt) {
   const h = Math.floor(timeInt / 100);
@@ -47,42 +38,45 @@ function toISODate(date) {
   return date.toISOString().split("T")[0];
 }
 
-// ─── WebUntis via Browser ────────────────────────────────────────────────────
-
 async function fetchTimetable() {
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext();
   const page = await context.newPage();
 
   try {
-    // 1. IServ Login
     console.log("🔐 IServ Login...");
-    await page.goto(ISERV_URL + "/login", { waitUntil: "networkidle" });
+    await page.goto(ISERV_URL + "/login", { waitUntil: "domcontentloaded", timeout: 30000 });
+    
+    // Felder ausfüllen
     await page.fill('input[name="_username"]', ISERV_USER);
     await page.fill('input[name="_password"]', ISERV_PASS);
-    await page.click('button[type="submit"]');
-    await page.waitForNavigation({ waitUntil: "networkidle" });
-    console.log("✅ Eingeloggt");
+    
+    // Submit und auf URL-Änderung warten statt Navigation
+    await Promise.all([
+      page.waitForURL("**/iserv/**", { timeout: 30000 }),
+      page.click('button[type="submit"]'),
+    ]);
 
-    // 2. WebUntis aufrufen – API direkt abfragen mit Session-Cookies
-    console.log("📡 Rufe WebUntis API ab...");
-
-    const monday0 = getMondayOfWeek(0);
-    const monday1 = getMondayOfWeek(1);
+    console.log("✅ Eingeloggt, aktuelle URL:", page.url());
 
     const allLessons = [];
 
-    for (const monday of [monday0, monday1]) {
+    for (const offset of [0, 1]) {
+      const monday = getMondayOfWeek(offset);
       const dateStr = toISODate(monday);
       const apiUrl = `https://wkdo.webuntis.com/WebUntis/api/public/timetable/weekly/student?elementId=5697&date=${dateStr}&formatId=1`;
 
       const response = await page.evaluate(async (url) => {
-        const res = await fetch(url, { credentials: "include" });
-        return { ok: res.ok, status: res.status, body: await res.text() };
+        try {
+          const res = await fetch(url, { credentials: "include" });
+          return { ok: res.ok, status: res.status, body: await res.text() };
+        } catch (e) {
+          return { ok: false, status: 0, body: e.message };
+        }
       }, apiUrl);
 
       if (!response.ok) {
-        console.warn(`⚠️ API ${dateStr}: ${response.status}`);
+        console.warn(`⚠️ API ${dateStr}: ${response.status} - ${response.body.slice(0, 100)}`);
         continue;
       }
 
@@ -114,15 +108,13 @@ async function fetchTimetable() {
   }
 }
 
-// ─── Notion ──────────────────────────────────────────────────────────────────
-
 async function deleteEntriesForDate(dateStr) {
   const res = await notion.databases.query({
     database_id: DATABASE_ID,
     filter: { property: "Datum", date: { equals: dateStr } },
   });
-  for (const page of res.results) {
-    await notion.pages.update({ page_id: page.id, archived: true });
+  for (const p of res.results) {
+    await notion.pages.update({ page_id: p.id, archived: true });
   }
   return res.results.length;
 }
@@ -142,11 +134,8 @@ async function createEntry(lesson) {
   });
 }
 
-// ─── Hauptprogramm ───────────────────────────────────────────────────────────
-
 async function sync() {
   console.log("🚀 Starte WebUntis → Notion Sync...\n");
-
   const allLessons = await fetchTimetable();
 
   if (allLessons.length === 0) {
