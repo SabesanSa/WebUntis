@@ -1,4 +1,4 @@
-name: 📅 Stundenplan Sync
+name: Stundenplan Sync
 
 on:
   schedule:
@@ -7,13 +7,11 @@ on:
 
 jobs:
   sync:
-    name: WebUntis → Notion
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: npm install
-      - name: Stundenplan synchronisieren
+      - run: node sync.js
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
-        run: node sync.js
