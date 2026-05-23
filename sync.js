@@ -1,31 +1,20 @@
 /**
- * WebUntis → Notion Timetable Sync
- * Schule: Westfalen Kolleg Dortmund (wkdo)
+ * WebUntis → Notion Sync
+ * Login via IServ → WebUntis
+ * Schule: Westfalen Kolleg Dortmund
  */
 
+const { chromium } = require("playwright");
 const { Client } = require("@notionhq/client");
 
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 const DATABASE_ID = process.env.NOTION_DATABASE_ID;
-
-const WEBUNTIS_SERVER = "wkdo";
-const ENTITY_ID = 5697;
+const ISERV_URL = "https://westfalenkolleg-dortmund-edu.de/iserv";
+const ISERV_USER = process.env.ISERV_USER;
+const ISERV_PASS = process.env.ISERV_PASS;
+const WEBUNTIS_URL = "https://wkdo.webuntis.com/WebUntis?school=wkdo#/basic/timetablePublic/my-student";
 
 // ─── Hilfsfunktionen ────────────────────────────────────────────────────────
-
-function getMondayOfWeek(offset = 0) {
-  const today = new Date();
-  const day = today.getDay();
-  const diff = today.getDate() - day + (day === 0 ? -6 : 1);
-  const monday = new Date(today);
-  monday.setDate(diff + offset * 7);
-  monday.setHours(0, 0, 0, 0);
-  return monday;
-}
-
-function toISODate(date) {
-  return date.toISOString().split("T")[0];
-}
 
 function parseTime(timeInt) {
   const h = Math.floor(timeInt / 100);
@@ -44,57 +33,85 @@ function getStatus(period) {
   return "Normal";
 }
 
-// ─── WebUntis API ────────────────────────────────────────────────────────────
-
-async function fetchWeek(mondayDate) {
-  const dateStr = toISODate(mondayDate);
-  const url = `https://${WEBUNTIS_SERVER}.webuntis.com/WebUntis/api/public/timetable/weekly/student?elementId=${ENTITY_ID}&date=${dateStr}&formatId=1`;
-
-  console.log(`📡 Fetching WebUntis: ${url}`);
-  const res = await fetch(url);
-
-  if (!res.ok) {
-    throw new Error(`WebUntis API Error: ${res.status} ${res.statusText}`);
-  }
-
-  const json = await res.json();
-  return json;
+function getMondayOfWeek(offset = 0) {
+  const today = new Date();
+  const day = today.getDay();
+  const diff = today.getDate() - day + (day === 0 ? -6 : 1);
+  const monday = new Date(today);
+  monday.setDate(diff + offset * 7);
+  monday.setHours(0, 0, 0, 0);
+  return monday;
 }
 
-function extractPeriods(weekData) {
-  // Unterstützt verschiedene WebUntis-Antwortformate
-  const data = weekData?.data ?? weekData;
-  const days =
-    data?.days ??
-    data?.weeks?.[0]?.days ??
-    data?.result?.days ??
-    [];
+function toISODate(date) {
+  return date.toISOString().split("T")[0];
+}
 
-  const lessons = [];
+// ─── WebUntis via Browser ────────────────────────────────────────────────────
 
-  for (const day of days) {
-    const dateStr = parseDateInt(day.date);
-    const periods = day.periods ?? [];
+async function fetchTimetable() {
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext();
+  const page = await context.newPage();
 
-    for (const period of periods) {
-      const subject =
-        period.subjects?.[0]?.longName ??
-        period.subjects?.[0]?.name ??
-        "Unbekannt";
+  try {
+    // 1. IServ Login
+    console.log("🔐 IServ Login...");
+    await page.goto(ISERV_URL + "/login", { waitUntil: "networkidle" });
+    await page.fill('input[name="_username"]', ISERV_USER);
+    await page.fill('input[name="_password"]', ISERV_PASS);
+    await page.click('button[type="submit"]');
+    await page.waitForNavigation({ waitUntil: "networkidle" });
+    console.log("✅ Eingeloggt");
 
-      lessons.push({
-        date: dateStr,
-        subject,
-        startTime: parseTime(period.startTime),
-        endTime: parseTime(period.endTime),
-        room: period.rooms?.[0]?.name ?? "",
-        teacher: period.teachers?.[0]?.longName ?? period.teachers?.[0]?.name ?? "",
-        status: getStatus(period),
-      });
+    // 2. WebUntis aufrufen – API direkt abfragen mit Session-Cookies
+    console.log("📡 Rufe WebUntis API ab...");
+
+    const monday0 = getMondayOfWeek(0);
+    const monday1 = getMondayOfWeek(1);
+
+    const allLessons = [];
+
+    for (const monday of [monday0, monday1]) {
+      const dateStr = toISODate(monday);
+      const apiUrl = `https://wkdo.webuntis.com/WebUntis/api/public/timetable/weekly/student?elementId=5697&date=${dateStr}&formatId=1`;
+
+      const response = await page.evaluate(async (url) => {
+        const res = await fetch(url, { credentials: "include" });
+        return { ok: res.ok, status: res.status, body: await res.text() };
+      }, apiUrl);
+
+      if (!response.ok) {
+        console.warn(`⚠️ API ${dateStr}: ${response.status}`);
+        continue;
+      }
+
+      const json = JSON.parse(response.body);
+      const data = json?.data ?? json;
+      const days = data?.days ?? data?.weeks?.[0]?.days ?? [];
+
+      for (const day of days) {
+        const dateISO = parseDateInt(day.date);
+        for (const period of day.periods ?? []) {
+          allLessons.push({
+            date: dateISO,
+            subject: period.subjects?.[0]?.longName ?? period.subjects?.[0]?.name ?? "Unbekannt",
+            startTime: parseTime(period.startTime),
+            endTime: parseTime(period.endTime),
+            room: period.rooms?.[0]?.name ?? "",
+            teacher: period.teachers?.[0]?.longName ?? period.teachers?.[0]?.name ?? "",
+            status: getStatus(period),
+          });
+        }
+      }
+
+      console.log(`✅ Woche ab ${dateStr}: ${allLessons.length} Stunden`);
     }
-  }
 
-  return lessons;
+    return allLessons;
+  } finally {
+    await browser.close();
+  }
 }
 
 // ─── Notion ──────────────────────────────────────────────────────────────────
@@ -104,11 +121,9 @@ async function deleteEntriesForDate(dateStr) {
     database_id: DATABASE_ID,
     filter: { property: "Datum", date: { equals: dateStr } },
   });
-
   for (const page of res.results) {
     await notion.pages.update({ page_id: page.id, archived: true });
   }
-
   return res.results.length;
 }
 
@@ -132,41 +147,21 @@ async function createEntry(lesson) {
 async function sync() {
   console.log("🚀 Starte WebUntis → Notion Sync...\n");
 
-  // Aktuelle Woche + nächste Woche laden
-  const weeks = [getMondayOfWeek(0), getMondayOfWeek(1)];
-  const allLessons = [];
-
-  for (const monday of weeks) {
-    const raw = await fetchWeek(monday);
-    const lessons = extractPeriods(raw);
-    console.log(`✅ Woche ab ${toISODate(monday)}: ${lessons.length} Stunden gefunden`);
-    allLessons.push(...lessons);
-  }
+  const allLessons = await fetchTimetable();
 
   if (allLessons.length === 0) {
-    console.warn("⚠️  Keine Stunden gefunden. Bitte API-Antwort prüfen.");
+    console.warn("⚠️ Keine Stunden gefunden.");
     process.exit(1);
   }
 
-  // Alle betroffenen Tage ermitteln
   const dates = [...new Set(allLessons.map((l) => l.date))].sort();
-
   console.log(`\n📅 Verarbeite ${dates.length} Tage...\n`);
 
   for (const date of dates) {
     const lessonsOnDay = allLessons.filter((l) => l.date === date);
-
-    // Alte Einträge löschen
     const deleted = await deleteEntriesForDate(date);
-
-    // Neue Einträge anlegen
-    for (const lesson of lessonsOnDay) {
-      await createEntry(lesson);
-    }
-
-    console.log(
-      `  📆 ${date}: ${deleted > 0 ? `${deleted} alte gelöscht, ` : ""}${lessonsOnDay.length} neue angelegt`
-    );
+    for (const lesson of lessonsOnDay) await createEntry(lesson);
+    console.log(`  📆 ${date}: ${deleted > 0 ? `${deleted} alte gelöscht, ` : ""}${lessonsOnDay.length} neue angelegt`);
   }
 
   console.log("\n✨ Sync abgeschlossen!");
