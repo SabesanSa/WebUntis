@@ -3,9 +3,9 @@ const { Client } = require("@notionhq/client");
 
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 const DATABASE_ID = process.env.NOTION_DATABASE_ID;
-const ISERV_URL = "https://westfalenkolleg-dortmund-edu.de/iserv";
 const ISERV_USER = process.env.ISERV_USER;
 const ISERV_PASS = process.env.ISERV_PASS;
+const ISERV_URL = "https://westfalenkolleg-dortmund-edu.de/iserv";
 
 function parseTime(timeInt) {
   const h = Math.floor(timeInt / 100);
@@ -43,6 +43,19 @@ async function fetchTimetable() {
   const context = await browser.newContext();
   const page = await context.newPage();
 
+  // Alle API-Antworten von WebUntis abfangen
+  const capturedData = [];
+  page.on("response", async (response) => {
+    const url = response.url();
+    if (url.includes("webuntis.com") && url.includes("timetable")) {
+      try {
+        const json = await response.json();
+        console.log("🎯 Abgefangen:", url);
+        capturedData.push(json);
+      } catch {}
+    }
+  });
+
   try {
     // 1. IServ Login
     console.log("🔐 IServ Login...");
@@ -55,53 +68,51 @@ async function fetchTimetable() {
     ]);
     console.log("✅ IServ eingeloggt");
 
-    // 2. WebUntis über SSO aufrufen um Session zu etablieren
-    console.log("🌐 Öffne WebUntis via SSO...");
-    await page.goto("https://wkdo.webuntis.com/WebUntis?school=wkdo", {
-      waitUntil: "domcontentloaded",
-      timeout: 30000,
-    });
-    // Kurz warten damit WebUntis die Session aufbauen kann
-    await page.waitForTimeout(3000);
-    console.log("✅ WebUntis geladen, URL:", page.url());
+    // 2. WebUntis App über IServ öffnen (SSO-Link suchen)
+    console.log("🔍 Suche WebUntis-Link in IServ...");
+    await page.goto(ISERV_URL + "/", { waitUntil: "domcontentloaded", timeout: 15000 });
+    
+    // WebUntis-Link finden und klicken
+    const wuLink = await page.$('a[href*="webuntis"]');
+    if (wuLink) {
+      console.log("✅ WebUntis-Link gefunden, klicke...");
+      await Promise.all([
+        page.waitForURL("**/webuntis.com/**", { timeout: 20000 }),
+        wuLink.click(),
+      ]);
+    } else {
+      // Direkt zur öffentlichen URL mit EntityId
+      console.log("ℹ️ Kein SSO-Link, lade öffentlichen Stundenplan...");
+      await page.goto(
+        "https://wkdo.webuntis.com/WebUntis?school=wkdo#/basic/timetablePublic/my-student?date=2026-05-18&entityId=5697",
+        { waitUntil: "domcontentloaded", timeout: 20000 }
+      );
+    }
 
-    // 3. API direkt auf der WebUntis-Seite aufrufen (gleiche Domain = kein CORS)
-    const allLessons = [];
+    console.log("✅ WebUntis URL:", page.url());
+    
+    // Warten bis Daten geladen
+    await page.waitForTimeout(5000);
 
+    // Durch Wochen navigieren um Daten zu laden
     for (const offset of [0, 1]) {
       const monday = getMondayOfWeek(offset);
       const dateStr = toISODate(monday);
-      const apiUrl = `https://wkdo.webuntis.com/WebUntis/api/public/timetable/weekly/student?elementId=5697&date=${dateStr}&formatId=1`;
+      await page.goto(
+        `https://wkdo.webuntis.com/WebUntis?school=wkdo#/basic/timetablePublic/my-student?date=${dateStr}&entityId=5697`,
+        { waitUntil: "domcontentloaded", timeout: 15000 }
+      );
+      await page.waitForTimeout(3000);
+      console.log(`📅 Woche ${dateStr} geladen`);
+    }
 
-      console.log(`📡 API Woche ab ${dateStr}...`);
+    console.log(`\n📊 ${capturedData.length} API-Antworten abgefangen`);
 
-      const response = await page.evaluate(async (url) => {
-        try {
-          const res = await fetch(url, { credentials: "include" });
-          return { ok: res.ok, status: res.status, body: await res.text() };
-        } catch (e) {
-          return { ok: false, status: 0, body: e.message };
-        }
-      }, apiUrl);
-
-      console.log(`   Status: ${response.status}`);
-
-      if (!response.ok) {
-        console.warn(`⚠️ Fehlgeschlagen: ${response.body.slice(0, 200)}`);
-        continue;
-      }
-
-      let json;
-      try {
-        json = JSON.parse(response.body);
-      } catch {
-        console.warn("⚠️ JSON-Parsing fehlgeschlagen");
-        continue;
-      }
-
+    // Stunden aus abgefangenen Daten extrahieren
+    const allLessons = [];
+    for (const json of capturedData) {
       const data = json?.data ?? json;
       const days = data?.days ?? data?.weeks?.[0]?.days ?? [];
-
       for (const day of days) {
         const dateISO = parseDateInt(day.date);
         for (const period of day.periods ?? []) {
@@ -116,8 +127,6 @@ async function fetchTimetable() {
           });
         }
       }
-
-      console.log(`✅ Woche ab ${dateStr}: ${allLessons.length} Stunden gesamt`);
     }
 
     return allLessons;
