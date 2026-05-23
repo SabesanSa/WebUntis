@@ -81,8 +81,15 @@ async function fetchTimetable() {
 
     // 2. "Anmeldung mit IServ" klicken
     console.log("🔘 Klicke 'Anmeldung mit IServ'...");
-    await page.waitForSelector('button:has-text("IServ")', { state: 'visible', timeout: 15000 });
-    await page.click('button:has-text("IServ")');
+    // JavaScript-Click umgeht Visibility-Checks
+    await page.waitForTimeout(2000);
+    await page.evaluate(() => {
+      const els = document.querySelectorAll('button, a');
+      for (const el of els) {
+        if (el.textContent.includes('IServ')) { el.click(); return true; }
+      }
+      return false;
+    });
     await page.waitForTimeout(3000);
     console.log("   URL:", page.url());
 
