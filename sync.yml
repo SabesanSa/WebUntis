@@ -1,0 +1,33 @@
+name: 📅 Stundenplan Sync
+
+on:
+  schedule:
+    # Täglich um 05:00 UTC = 06:00 oder 07:00 Uhr deutscher Zeit
+    - cron: "0 5 * * *"
+
+  # Manuell auslösbar (zum Testen)
+  workflow_dispatch:
+
+jobs:
+  sync:
+    name: WebUntis → Notion
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Repository laden
+        uses: actions/checkout@v4
+
+      - name: ⚙️ Node.js einrichten
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: 📦 Abhängigkeiten installieren
+        run: npm ci
+
+      - name: 🔄 Stundenplan synchronisieren
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+        run: node sync.js
