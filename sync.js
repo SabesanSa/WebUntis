@@ -6,21 +6,22 @@ const DATABASE_ID = process.env.NOTION_DATABASE_ID;
 const ISERV_USER = process.env.ISERV_USER;
 const ISERV_PASS = process.env.ISERV_PASS;
 const ISERV_URL = "https://westfalenkolleg-dortmund-edu.de/iserv";
+const STUDENT_ID = 13837;
 
-function parseTime(timeInt) {
-  const h = Math.floor(timeInt / 100);
-  const m = timeInt % 100;
+function parseTime(t) {
+  const h = Math.floor(t / 100);
+  const m = t % 100;
   return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
 }
 
-function parseDateInt(dateInt) {
-  const s = String(dateInt);
+function parseDateInt(d) {
+  const s = String(d);
   return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`;
 }
 
-function getStatus(period) {
-  if (period.cellState === "CANCEL" || period.type === 2) return "Ausfall";
-  if (period.cellState === "SUBSTITUTION" || period.type === 3) return "Vertretung";
+function getStatus(p) {
+  if (p.cellState === "CANCEL" || p.type === 2) return "Ausfall";
+  if (p.cellState === "SUBSTITUTION" || p.type === 3) return "Vertretung";
   return "Normal";
 }
 
@@ -34,31 +35,18 @@ function getMondayOfWeek(offset = 0) {
   return monday;
 }
 
-function toISODate(date) {
-  return date.toISOString().split("T")[0];
+function toISODate(d) {
+  return d.toISOString().split("T")[0];
 }
 
 async function fetchTimetable() {
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext();
-  const page = await context.newPage();
-
-  // Alle API-Antworten von WebUntis abfangen
-  const capturedData = [];
-  page.on("response", async (response) => {
-    const url = response.url();
-    if (url.includes("webuntis.com") && url.includes("timetable")) {
-      try {
-        const json = await response.json();
-        console.log("🎯 Abgefangen:", url);
-        capturedData.push(json);
-      } catch {}
-    }
-  });
 
   try {
     // 1. IServ Login
     console.log("🔐 IServ Login...");
+    const page = await context.newPage();
     await page.goto(ISERV_URL + "/login", { waitUntil: "domcontentloaded", timeout: 30000 });
     await page.fill('input[name="_username"]', ISERV_USER);
     await page.fill('input[name="_password"]', ISERV_PASS);
@@ -68,51 +56,93 @@ async function fetchTimetable() {
     ]);
     console.log("✅ IServ eingeloggt");
 
-    // 2. WebUntis App über IServ öffnen (SSO-Link suchen)
-    console.log("🔍 Suche WebUntis-Link in IServ...");
-    await page.goto(ISERV_URL + "/", { waitUntil: "domcontentloaded", timeout: 15000 });
-    
-    // WebUntis-Link finden und klicken
+    // 2. WebUntis-Link in IServ finden – öffnet neuen Tab
+    console.log("🔍 Suche WebUntis-Link...");
     const wuLink = await page.$('a[href*="webuntis"]');
+    
+    let wuPage;
     if (wuLink) {
-      console.log("✅ WebUntis-Link gefunden, klicke...");
-      await Promise.all([
-        page.waitForURL("**/webuntis.com/**", { timeout: 20000 }),
+      // Neuen Tab abfangen
+      const [newPage] = await Promise.all([
+        context.waitForEvent("page", { timeout: 15000 }),
         wuLink.click(),
       ]);
+      wuPage = newPage;
+      await wuPage.waitForLoadState("domcontentloaded", { timeout: 20000 });
+      console.log("✅ WebUntis via SSO geöffnet:", wuPage.url());
     } else {
-      // Direkt zur öffentlichen URL mit EntityId
-      console.log("ℹ️ Kein SSO-Link, lade öffentlichen Stundenplan...");
-      await page.goto(
-        "https://wkdo.webuntis.com/WebUntis?school=wkdo#/basic/timetablePublic/my-student?date=2026-05-18&entityId=5697",
-        { waitUntil: "domcontentloaded", timeout: 20000 }
-      );
+      // Direkt zu WebUntis navigieren
+      console.log("ℹ️ Kein SSO-Link gefunden, navigiere direkt...");
+      wuPage = await context.newPage();
+      await wuPage.goto("https://wkdo.webuntis.com/WebUntis?school=wkdo", {
+        waitUntil: "domcontentloaded",
+        timeout: 20000,
+      });
     }
 
-    console.log("✅ WebUntis URL:", page.url());
-    
-    // Warten bis Daten geladen
-    await page.waitForTimeout(5000);
+    // 3. Kurz warten bis Session steht
+    await wuPage.waitForTimeout(2000);
 
-    // Durch Wochen navigieren um Daten zu laden
+    // 4. API mit korrekter Student-ID aufrufen
+    const allLessons = [];
+
     for (const offset of [0, 1]) {
       const monday = getMondayOfWeek(offset);
       const dateStr = toISODate(monday);
-      await page.goto(
-        `https://wkdo.webuntis.com/WebUntis?school=wkdo#/basic/timetablePublic/my-student?date=${dateStr}&entityId=5697`,
-        { waitUntil: "domcontentloaded", timeout: 15000 }
-      );
-      await page.waitForTimeout(3000);
-      console.log(`📅 Woche ${dateStr} geladen`);
-    }
 
-    console.log(`\n📊 ${capturedData.length} API-Antworten abgefangen`);
+      // Primärer Endpunkt (eingeloggt)
+      const apiUrl = `https://wkdo.webuntis.com/WebUntis/api/rest/view/v1/timetable/student?id=${STUDENT_ID}&date=${dateStr}`;
+      
+      console.log(`📡 Lade Woche ab ${dateStr}...`);
 
-    // Stunden aus abgefangenen Daten extrahieren
-    const allLessons = [];
-    for (const json of capturedData) {
+      const result = await wuPage.evaluate(async (url) => {
+        try {
+          const res = await fetch(url, { credentials: "include" });
+          return { ok: res.ok, status: res.status, body: await res.text() };
+        } catch (e) {
+          return { ok: false, status: 0, body: e.message };
+        }
+      }, apiUrl);
+
+      console.log(`   Status: ${result.status}`);
+
+      if (!result.ok) {
+        // Fallback: älterer API-Endpunkt
+        const fallbackUrl = `https://wkdo.webuntis.com/WebUntis/api/public/timetable/weekly/student?elementId=${STUDENT_ID}&date=${dateStr}&formatId=1`;
+        const fallback = await wuPage.evaluate(async (url) => {
+          try {
+            const res = await fetch(url, { credentials: "include" });
+            return { ok: res.ok, status: res.status, body: await res.text() };
+          } catch (e) {
+            return { ok: false, status: 0, body: e.message };
+          }
+        }, fallbackUrl);
+
+        console.log(`   Fallback Status: ${fallback.status}`);
+        if (!fallback.ok) {
+          console.warn(`⚠️ Beide Endpunkte fehlgeschlagen für ${dateStr}`);
+          continue;
+        }
+        result.body = fallback.body;
+        result.ok = true;
+      }
+
+      let json;
+      try {
+        json = JSON.parse(result.body);
+      } catch {
+        console.warn(`⚠️ JSON-Parsing fehlgeschlagen`);
+        continue;
+      }
+
+      // Verschiedene Antwortformate unterstützen
       const data = json?.data ?? json;
-      const days = data?.days ?? data?.weeks?.[0]?.days ?? [];
+      const days =
+        data?.days ??
+        data?.weeks?.[0]?.days ??
+        data?.result?.days ??
+        (Array.isArray(data) ? data : []);
+
       for (const day of days) {
         const dateISO = parseDateInt(day.date);
         for (const period of day.periods ?? []) {
@@ -127,6 +157,8 @@ async function fetchTimetable() {
           });
         }
       }
+
+      console.log(`✅ Woche ab ${dateStr}: ${allLessons.length} Stunden gesamt`);
     }
 
     return allLessons;
