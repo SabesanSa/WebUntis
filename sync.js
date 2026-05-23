@@ -1,27 +1,35 @@
+/**
+ * WebUntis → Notion Sync
+ * Login via IServ → WebUntis
+ * Schule: Westfalen Kolleg Dortmund
+ */
+
 const { chromium } = require("playwright");
 const { Client } = require("@notionhq/client");
 
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 const DATABASE_ID = process.env.NOTION_DATABASE_ID;
+const ISERV_URL = "https://westfalenkolleg-dortmund-edu.de/iserv";
 const ISERV_USER = process.env.ISERV_USER;
 const ISERV_PASS = process.env.ISERV_PASS;
-const ISERV_URL = "https://westfalenkolleg-dortmund-edu.de/iserv";
-const STUDENT_ID = 13837;
+const WEBUNTIS_URL = "https://wkdo.webuntis.com/WebUntis?school=wkdo#/basic/timetablePublic/my-student";
 
-function parseTime(t) {
-  const h = Math.floor(t / 100);
-  const m = t % 100;
+// ─── Hilfsfunktionen ────────────────────────────────────────────────────────
+
+function parseTime(timeInt) {
+  const h = Math.floor(timeInt / 100);
+  const m = timeInt % 100;
   return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
 }
 
-function parseDateInt(d) {
-  const s = String(d);
+function parseDateInt(dateInt) {
+  const s = String(dateInt);
   return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`;
 }
 
-function getStatus(p) {
-  if (p.cellState === "CANCEL" || p.type === 2) return "Ausfall";
-  if (p.cellState === "SUBSTITUTION" || p.type === 3) return "Vertretung";
+function getStatus(period) {
+  if (period.cellState === "CANCEL" || period.type === 2) return "Ausfall";
+  if (period.cellState === "SUBSTITUTION" || period.type === 3) return "Vertretung";
   return "Normal";
 }
 
@@ -35,113 +43,52 @@ function getMondayOfWeek(offset = 0) {
   return monday;
 }
 
-function toISODate(d) {
-  return d.toISOString().split("T")[0];
+function toISODate(date) {
+  return date.toISOString().split("T")[0];
 }
+
+// ─── WebUntis via Browser ────────────────────────────────────────────────────
 
 async function fetchTimetable() {
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext();
+  const page = await context.newPage();
 
   try {
     // 1. IServ Login
     console.log("🔐 IServ Login...");
-    const page = await context.newPage();
-    await page.goto(ISERV_URL + "/login", { waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.goto(ISERV_URL + "/login", { waitUntil: "networkidle" });
     await page.fill('input[name="_username"]', ISERV_USER);
     await page.fill('input[name="_password"]', ISERV_PASS);
-    await Promise.all([
-      page.waitForURL("**/iserv/**", { timeout: 30000 }),
-      page.click('button[type="submit"]'),
-    ]);
-    console.log("✅ IServ eingeloggt");
+    await page.click('button[type="submit"]');
+    await page.waitForNavigation({ waitUntil: "networkidle" });
+    console.log("✅ Eingeloggt");
 
-    // 2. WebUntis-Link in IServ finden – öffnet neuen Tab
-    console.log("🔍 Suche WebUntis-Link...");
-    const wuLink = await page.$('a[href*="webuntis"]');
-    
-    let wuPage;
-    if (wuLink) {
-      // Neuen Tab abfangen
-      const [newPage] = await Promise.all([
-        context.waitForEvent("page", { timeout: 15000 }),
-        wuLink.click(),
-      ]);
-      wuPage = newPage;
-      await wuPage.waitForLoadState("domcontentloaded", { timeout: 20000 });
-      console.log("✅ WebUntis via SSO geöffnet:", wuPage.url());
-    } else {
-      // Direkt zu WebUntis navigieren
-      console.log("ℹ️ Kein SSO-Link gefunden, navigiere direkt...");
-      wuPage = await context.newPage();
-      await wuPage.goto("https://wkdo.webuntis.com/WebUntis?school=wkdo", {
-        waitUntil: "domcontentloaded",
-        timeout: 20000,
-      });
-    }
+    // 2. WebUntis aufrufen – API direkt abfragen mit Session-Cookies
+    console.log("📡 Rufe WebUntis API ab...");
 
-    // 3. Kurz warten bis Session steht
-    await wuPage.waitForTimeout(2000);
+    const monday0 = getMondayOfWeek(0);
+    const monday1 = getMondayOfWeek(1);
 
-    // 4. API mit korrekter Student-ID aufrufen
     const allLessons = [];
 
-    for (const offset of [0, 1]) {
-      const monday = getMondayOfWeek(offset);
+    for (const monday of [monday0, monday1]) {
       const dateStr = toISODate(monday);
+      const apiUrl = `https://wkdo.webuntis.com/WebUntis/api/public/timetable/weekly/student?elementId=5697&date=${dateStr}&formatId=1`;
 
-      // Primärer Endpunkt (eingeloggt)
-      const apiUrl = `https://wkdo.webuntis.com/WebUntis/api/rest/view/v1/timetable/student?id=${STUDENT_ID}&date=${dateStr}`;
-      
-      console.log(`📡 Lade Woche ab ${dateStr}...`);
-
-      const result = await wuPage.evaluate(async (url) => {
-        try {
-          const res = await fetch(url, { credentials: "include" });
-          return { ok: res.ok, status: res.status, body: await res.text() };
-        } catch (e) {
-          return { ok: false, status: 0, body: e.message };
-        }
+      const response = await page.evaluate(async (url) => {
+        const res = await fetch(url, { credentials: "include" });
+        return { ok: res.ok, status: res.status, body: await res.text() };
       }, apiUrl);
 
-      console.log(`   Status: ${result.status}`);
-
-      if (!result.ok) {
-        // Fallback: älterer API-Endpunkt
-        const fallbackUrl = `https://wkdo.webuntis.com/WebUntis/api/public/timetable/weekly/student?elementId=${STUDENT_ID}&date=${dateStr}&formatId=1`;
-        const fallback = await wuPage.evaluate(async (url) => {
-          try {
-            const res = await fetch(url, { credentials: "include" });
-            return { ok: res.ok, status: res.status, body: await res.text() };
-          } catch (e) {
-            return { ok: false, status: 0, body: e.message };
-          }
-        }, fallbackUrl);
-
-        console.log(`   Fallback Status: ${fallback.status}`);
-        if (!fallback.ok) {
-          console.warn(`⚠️ Beide Endpunkte fehlgeschlagen für ${dateStr}`);
-          continue;
-        }
-        result.body = fallback.body;
-        result.ok = true;
-      }
-
-      let json;
-      try {
-        json = JSON.parse(result.body);
-      } catch {
-        console.warn(`⚠️ JSON-Parsing fehlgeschlagen`);
+      if (!response.ok) {
+        console.warn(`⚠️ API ${dateStr}: ${response.status}`);
         continue;
       }
 
-      // Verschiedene Antwortformate unterstützen
+      const json = JSON.parse(response.body);
       const data = json?.data ?? json;
-      const days =
-        data?.days ??
-        data?.weeks?.[0]?.days ??
-        data?.result?.days ??
-        (Array.isArray(data) ? data : []);
+      const days = data?.days ?? data?.weeks?.[0]?.days ?? [];
 
       for (const day of days) {
         const dateISO = parseDateInt(day.date);
@@ -158,7 +105,7 @@ async function fetchTimetable() {
         }
       }
 
-      console.log(`✅ Woche ab ${dateStr}: ${allLessons.length} Stunden gesamt`);
+      console.log(`✅ Woche ab ${dateStr}: ${allLessons.length} Stunden`);
     }
 
     return allLessons;
@@ -167,13 +114,15 @@ async function fetchTimetable() {
   }
 }
 
+// ─── Notion ──────────────────────────────────────────────────────────────────
+
 async function deleteEntriesForDate(dateStr) {
   const res = await notion.databases.query({
     database_id: DATABASE_ID,
     filter: { property: "Datum", date: { equals: dateStr } },
   });
-  for (const p of res.results) {
-    await notion.pages.update({ page_id: p.id, archived: true });
+  for (const page of res.results) {
+    await notion.pages.update({ page_id: page.id, archived: true });
   }
   return res.results.length;
 }
@@ -193,8 +142,11 @@ async function createEntry(lesson) {
   });
 }
 
+// ─── Hauptprogramm ───────────────────────────────────────────────────────────
+
 async function sync() {
   console.log("🚀 Starte WebUntis → Notion Sync...\n");
+
   const allLessons = await fetchTimetable();
 
   if (allLessons.length === 0) {
