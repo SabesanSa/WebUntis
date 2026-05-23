@@ -1,15 +1,8 @@
 {
   "name": "webuntis-notion-sync",
   "version": "1.0.0",
-  "description": "Synchronisiert den WebUntis-Stundenplan täglich mit Notion",
-  "scripts": {
-    "sync": "node sync.js",
-    "setup": "node setup-notion.js"
-  },
   "dependencies": {
-    "@notionhq/client": "^2.2.15"
-  },
-  "engines": {
-    "node": ">=18"
+    "@notionhq/client": "^2.2.15",
+    "playwright": "^1.44.0"
   }
 }
