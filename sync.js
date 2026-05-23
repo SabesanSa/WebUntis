@@ -53,7 +53,7 @@ function extractLessons(json) {
 
 async function fetchTimetable() {
   const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext();
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
   const page = await context.newPage();
 
   // Alle Timetable-API-Antworten abfangen
@@ -81,7 +81,8 @@ async function fetchTimetable() {
 
     // 2. "Anmeldung mit IServ" klicken
     console.log("🔘 Klicke 'Anmeldung mit IServ'...");
-    await page.locator('button:has-text("IServ"), a:has-text("IServ")').first().click({ force: true, timeout: 10000 });
+    await page.waitForSelector('button:has-text("IServ")', { state: 'visible', timeout: 15000 });
+    await page.click('button:has-text("IServ")');
     await page.waitForTimeout(3000);
     console.log("   URL:", page.url());
 
