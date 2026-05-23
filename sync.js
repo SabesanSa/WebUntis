@@ -81,7 +81,7 @@ async function fetchTimetable() {
 
     // 2. "Anmeldung mit IServ" klicken
     console.log("🔘 Klicke 'Anmeldung mit IServ'...");
-    await page.click('button:has-text("IServ"), a:has-text("IServ")', { timeout: 10000 });
+    await page.locator('button:has-text("IServ"), a:has-text("IServ")').first().click({ force: true, timeout: 10000 });
     await page.waitForTimeout(3000);
     console.log("   URL:", page.url());
 
