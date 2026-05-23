@@ -53,10 +53,19 @@ async function fetchTimetable() {
       page.waitForURL("**/iserv/**", { timeout: 30000 }),
       page.click('button[type="submit"]'),
     ]);
-    console.log("✅ Eingeloggt");
+    console.log("✅ IServ eingeloggt");
 
-    // 2. WebUntis direkt aufrufen (neue Seite, eigene Domain)
-    const wuPage = await context.newPage();
+    // 2. WebUntis über SSO aufrufen um Session zu etablieren
+    console.log("🌐 Öffne WebUntis via SSO...");
+    await page.goto("https://wkdo.webuntis.com/WebUntis?school=wkdo", {
+      waitUntil: "domcontentloaded",
+      timeout: 30000,
+    });
+    // Kurz warten damit WebUntis die Session aufbauen kann
+    await page.waitForTimeout(3000);
+    console.log("✅ WebUntis geladen, URL:", page.url());
+
+    // 3. API direkt auf der WebUntis-Seite aufrufen (gleiche Domain = kein CORS)
     const allLessons = [];
 
     for (const offset of [0, 1]) {
@@ -64,26 +73,29 @@ async function fetchTimetable() {
       const dateStr = toISODate(monday);
       const apiUrl = `https://wkdo.webuntis.com/WebUntis/api/public/timetable/weekly/student?elementId=5697&date=${dateStr}&formatId=1`;
 
-      console.log(`📡 Lade ${apiUrl}`);
+      console.log(`📡 API Woche ab ${dateStr}...`);
 
-      // Direkt zur API-URL navigieren
-      const response = await wuPage.goto(apiUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
+      const response = await page.evaluate(async (url) => {
+        try {
+          const res = await fetch(url, { credentials: "include" });
+          return { ok: res.ok, status: res.status, body: await res.text() };
+        } catch (e) {
+          return { ok: false, status: 0, body: e.message };
+        }
+      }, apiUrl);
 
-      if (!response || !response.ok()) {
-        console.warn(`⚠️ API ${dateStr}: Status ${response?.status()}`);
+      console.log(`   Status: ${response.status}`);
+
+      if (!response.ok) {
+        console.warn(`⚠️ Fehlgeschlagen: ${response.body.slice(0, 200)}`);
         continue;
       }
 
-      const body = await wuPage.content();
-      // JSON aus dem <pre> oder body-Tag extrahieren
-      const match = body.match(/<pre[^>]*>([\s\S]*?)<\/pre>/) || body.match(/<body[^>]*>([\s\S]*?)<\/body>/);
-      const jsonStr = match ? match[1].trim() : await response.text();
-
       let json;
       try {
-        json = JSON.parse(jsonStr);
+        json = JSON.parse(response.body);
       } catch {
-        console.warn(`⚠️ JSON-Parsing fehlgeschlagen für ${dateStr}`);
+        console.warn("⚠️ JSON-Parsing fehlgeschlagen");
         continue;
       }
 
@@ -105,7 +117,7 @@ async function fetchTimetable() {
         }
       }
 
-      console.log(`✅ Woche ab ${dateStr}: ${allLessons.length} Stunden`);
+      console.log(`✅ Woche ab ${dateStr}: ${allLessons.length} Stunden gesamt`);
     }
 
     return allLessons;
