@@ -53,8 +53,7 @@ function extractLessons(json) {
   return lessons;
 }
 
-// Warte bis URL ein bestimmtes Muster enthält – kein waitForNavigation
-async function waitForUrl(page, pattern, timeoutMs = 15000) {
+async function waitForUrl(page, pattern, timeoutMs = 10000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (page.url().includes(pattern)) return true;
@@ -69,7 +68,6 @@ async function fetchTimetable() {
   const page = await context.newPage();
   const capturedLessons = [];
 
-  // Alle JSON-Responses von WebUntis loggen
   page.on("response", async (response) => {
     const url = response.url();
     if (!url.includes("webuntis.com")) return;
@@ -78,74 +76,65 @@ async function fetchTimetable() {
     try {
       const body = await response.text();
       const path = url.replace(/https?:\/\/[^/]+/, "").split("?")[0];
-      console.log(`📥 ${response.status()} ${path}`);
-      if (body.startsWith("{") || body.startsWith("[")) {
-        console.log(`   ${body.slice(0, 150)}`);
+      if (path.includes("timetable") || path.includes("period") || path.includes("Timetable")) {
+        console.log(`📥 ${response.status()} ${path}`);
+        console.log(`   ${body.slice(0, 200)}`);
       }
       const json = JSON.parse(body);
       const lessons = extractLessons(json);
       if (lessons.length > 0) {
-        console.log(`🎯 ${lessons.length} Stunden!`);
+        console.log(`🎯 ${lessons.length} Stunden aus ${path}!`);
         capturedLessons.push(...lessons);
       }
     } catch {}
   });
 
   try {
-    // 1. WebUntis öffnen
+    // 1. Login
     console.log("🌐 Öffne WebUntis...");
-    await page.goto("https://wkdo.webuntis.com/WebUntis/?school=wkdo", { waitUntil: "domcontentloaded", timeout: 20000 });
+    await page.goto("https://wkdo.webuntis.com/WebUntis/?school=wkdo", {
+      waitUntil: "domcontentloaded", timeout: 20000
+    });
     await page.waitForTimeout(3000);
-    console.log("   URL:", page.url());
 
-    // 2. IServ-Button per JS klicken
     console.log("🔘 Klicke IServ-Button...");
     await page.evaluate(() => {
       for (const el of document.querySelectorAll("button, a")) {
         if (el.textContent.includes("IServ")) { el.click(); return; }
       }
     });
+    await waitForUrl(page, "iserv", 10000);
 
-    // Warten bis wir auf IServ-Login-Seite sind
-    const onIServ = await waitForUrl(page, "iserv", 10000);
-    console.log("   URL:", page.url());
-
-    if (onIServ && page.url().includes("login")) {
-      // 3. Login-Felder ausfüllen
-      console.log("🔐 Fülle Login-Felder aus...");
+    if (page.url().includes("login")) {
+      console.log("🔐 IServ Login...");
       await page.waitForSelector('input[name="_username"]', { timeout: 10000 });
       await page.fill('input[name="_username"]', ISERV_USER);
       await page.fill('input[name="_password"]', ISERV_PASS);
       await page.click('button[type="submit"]');
-      console.log("   Abgeschickt, warte...");
+      await page.waitForTimeout(4000);
     }
 
-    // 4. Warten bis wir auf IServ oder WebUntis sind
-    await page.waitForTimeout(4000);
-    console.log("   URL:", page.url());
-
-    // 5. Zulassen klicken falls OAuth-Seite
-    if (page.url().includes("iserv")) {
-      const zulassen = await page.$('button:has-text("Zulassen")');
-      if (zulassen) {
-        console.log("✅ Klicke Zulassen...");
-        await zulassen.click();
-        await page.waitForTimeout(4000);
-      }
+    const zulassen = await page.$('button:has-text("Zulassen")');
+    if (zulassen) {
+      console.log("✅ Klicke Zulassen...");
+      await zulassen.click();
+      await page.waitForTimeout(4000);
     }
 
+    // Warten bis SPA vollständig geladen ist
+    await page.waitForTimeout(3000);
     console.log("✅ Eingeloggt:", page.url());
 
-    // 6. Stundenplan-URL laden und Responses abfangen
-    const dateStr = toISODate(getMondayOfWeek(0));
-    const nextStr = toISODate(getMondayOfWeek(1));
+    // 2. Hash ändern statt page.goto – SPA bleibt geladen!
+    for (const offset of [0, 1]) {
+      const dateStr = toISODate(getMondayOfWeek(offset));
+      console.log(`\n📅 Navigiere zu Woche ab ${dateStr} (via Hash)...`);
 
-    for (const date of [dateStr, nextStr]) {
-      console.log(`\n📅 Lade Woche ab ${date}...`);
-      await page.goto(
-        `https://wkdo.webuntis.com/WebUntis?school=wkdo#/basic/timetablePublic/my-student?date=${date}&entityId=5697`,
-        { waitUntil: "domcontentloaded", timeout: 20000 }
-      );
+      await page.evaluate((hash) => {
+        window.location.hash = hash;
+      }, `#/basic/timetablePublic/my-student?date=${dateStr}&entityId=5697`);
+
+      // Warten bis Timetable-API-Calls erfolgen
       await page.waitForTimeout(8000);
       console.log(`   ${capturedLessons.length} Stunden bisher`);
     }
