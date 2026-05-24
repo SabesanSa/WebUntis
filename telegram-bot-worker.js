@@ -1,7 +1,8 @@
 // Cloudflare Worker – Telegram Bot für Schul-Abfragen
 // Umgebungsvariablen (in Cloudflare Dashboard setzen):
 //   NOTION_TOKEN, NOTION_DATABASE_ID, NOTION_TODO_DATABASE_ID,
-//   NOTION_PERSONAL_DB_ID, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+//   NOTION_PERSONAL_DB_ID, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+//   GITHUB_TOKEN, GITHUB_USERNAME
 
 export default {
   async fetch(request, env) {
@@ -39,6 +40,34 @@ async function handleNachricht(env, chatId, text) {
     await sendeTodos(env, chatId);
     return;
   }
+
+  // ── NEU: Schulcheck manuell auslösen ────────────────────────────────────────
+  if (t === 'schulcheck' || t === '/schulcheck' || t === 'check') {
+    const res = await fetch(
+      `https://api.github.com/repos/${env.GITHUB_USERNAME}/stundenplan-sync/actions/workflows/morning-check.yml/dispatches`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${env.GITHUB_TOKEN}`,
+          'Accept': 'application/vnd.github+json',
+          'Content-Type': 'application/json',
+          'User-Agent': 'schul-bot'
+        },
+        body: JSON.stringify({ ref: 'main' })
+      }
+    );
+
+    if (res.status === 204) {
+      await sendeTelegram(env, chatId, '⏳ Schulcheck wird gestartet – Nachricht kommt in ~30 Sekunden!');
+    } else {
+      const err = await res.text();
+      console.error('GitHub API Fehler:', res.status, err);
+      await sendeTelegram(env, chatId, '❌ Schulcheck konnte nicht gestartet werden. GitHub Token prüfen.');
+    }
+    return;
+  }
+  // ────────────────────────────────────────────────────────────────────────────
+
   if (t === 'hilfe' || t === '/hilfe' || t === '/start' || t === '/help') {
     await sendeTelegram(env, chatId, hilfeText());
     return;
@@ -48,7 +77,7 @@ async function handleNachricht(env, chatId, text) {
   const datum = parseDatum(t);
   if (!datum) {
     await sendeTelegram(env, chatId,
-      `❓ Ich verstehe das nicht.\n\nSchreib z.B.:\n• <b>heute</b>\n• <b>morgen</b>\n• <b>Donnerstag</b>\n• <b>27.5.</b>\n• <b>todos</b>\n• <b>hilfe</b>`
+      `❓ Ich verstehe das nicht.\n\nSchreib z.B.:\n• <b>heute</b>\n• <b>morgen</b>\n• <b>Donnerstag</b>\n• <b>27.5.</b>\n• <b>todos</b>\n• <b>schulcheck</b>\n• <b>hilfe</b>`
     );
     return;
   }
@@ -99,8 +128,7 @@ function parseDatum(t) {
     const ziel = wochentage[t];
     const heuteTag = heute.getDay();
     let diff = ziel - heuteTag;
-    if (diff < 0) diff += 7;        // Vergangener Tag → nächste Woche
-    // diff == 0 → heute
+    if (diff < 0) diff += 7;
     const d = new Date(heute);
     d.setDate(heute.getDate() + diff);
     return fmt(d);
@@ -260,6 +288,9 @@ function hilfeText() {
 
 ✅ <b>Aufgaben:</b>
 • <b>todos</b> – alle offenen Aufgaben
+
+🔄 <b>Schulcheck:</b>
+• <b>schulcheck</b> – Morgen-Check jetzt ausführen
 
 ❓ <b>hilfe</b> – diese Übersicht`;
 }
