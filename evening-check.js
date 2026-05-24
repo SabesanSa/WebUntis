@@ -84,6 +84,10 @@ function heute() {
 // ── Zeitzonencheck: nur um 20 Uhr Berliner Zeit ───────────────────────────────
 
 function checkUhrzeit() {
+  if (process.env.GITHUB_EVENT_NAME === 'workflow_dispatch') {
+    console.log('⚡ Manuell ausgelöst – Uhrzeitcheck übersprungen.');
+    return;
+  }
   const stunde = berlinHour();
   if (stunde !== 16) {
     console.log(`⏰ Berliner Zeit: ${stunde} Uhr – kein 16-Uhr-Slot, wird übersprungen.`);
