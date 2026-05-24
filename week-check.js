@@ -6,9 +6,7 @@ const NOTION_STUNDENPLAN = process.env.NOTION_DATABASE_ID;
 const NOTION_TODO_DB     = process.env.NOTION_TODO_DATABASE_ID;
 const TELEGRAM_TOKEN     = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
-const WOCHE_INPUT        = process.env.WOCHE_INPUT || 'diese'; // 'diese' oder 'naechste'
-
-// ── Hilfsfunktionen ───────────────────────────────────────────────────────────
+const WOCHE_INPUT        = process.env.WOCHE_INPUT || 'diese';
 
 function request(options) {
   return new Promise((resolve, reject) => {
@@ -42,20 +40,16 @@ function get(hostname, path) {
   return request({ hostname, path, method: 'GET' });
 }
 
-// Berliner Wochenbeginn (Montag) für eine gegebene Woche (0 = diese, 1 = nächste)
 function wochenbereich(offset = 0) {
   const heute = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Berlin' }));
-  const tag   = heute.getDay(); // 0=So, 1=Mo, ..., 6=Sa
+  const tag   = heute.getDay();
   const diffZuMontag = tag === 0 ? -6 : 1 - tag;
-
   const montag = new Date(heute);
   montag.setDate(heute.getDate() + diffZuMontag + offset * 7);
   montag.setHours(0, 0, 0, 0);
-
   const freitag = new Date(montag);
   freitag.setDate(montag.getDate() + 4);
-
-  const fmt = d => d.toLocaleDateString('fr-CA'); // YYYY-MM-DD
+  const fmt = d => d.toLocaleDateString('fr-CA');
   return { montag: fmt(montag), freitag: fmt(freitag), montagDate: montag };
 }
 
@@ -69,8 +63,6 @@ function addTage(dateStr, n) {
   d.setDate(d.getDate() + n);
   return d.toLocaleDateString('fr-CA');
 }
-
-// ── Notion ────────────────────────────────────────────────────────────────────
 
 async function notionQuery(dbId, filter) {
   const payload = filter ? { filter, page_size: 100 } : { page_size: 100 };
@@ -89,8 +81,6 @@ async function getWochenplan(montag, freitag) {
       { property: 'Datum', date: { on_or_before: freitag } }
     ]
   });
-
-  // Nach Tag gruppieren
   const tage = {};
   for (const page of rows) {
     const p = page.properties;
@@ -105,12 +95,9 @@ async function getWochenplan(montag, freitag) {
       status: p.Status?.select?.name || 'Normal'
     });
   }
-
-  // Stunden pro Tag sortieren
   for (const datum of Object.keys(tage)) {
     tage[datum].sort((a, b) => a.start.localeCompare(b.start));
   }
-
   return tage;
 }
 
@@ -120,7 +107,6 @@ async function getTodos() {
     property: 'Status',
     select: { does_not_equal: 'Erledigt' }
   });
-
   const prioritaetOrder = { 'Hoch': 0, 'Mittel': 1, 'Niedrig': 2, '': 3 };
   return rows
     .map(page => {
@@ -140,8 +126,6 @@ async function getTodos() {
     });
 }
 
-// ── Wetter: 5-Tages-Vorschau ─────────────────────────────────────────────────
-
 async function getWetterWoche() {
   const res = await get('api.open-meteo.com', [
     '/v1/forecast',
@@ -149,7 +133,6 @@ async function getWetterWoche() {
     '&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,weathercode',
     '&timezone=Europe%2FBerlin&forecast_days=8'
   ].join(''));
-
   const codes = {
     0:'☀️', 1:'🌤️', 2:'⛅', 3:'☁️',
     45:'🌫️', 48:'🌫️',
@@ -159,7 +142,6 @@ async function getWetterWoche() {
     80:'🌦️', 81:'🌧️', 82:'⛈️',
     95:'⛈️', 96:'⛈️', 99:'⛈️'
   };
-
   const tage = {};
   const daily = res.daily;
   for (let i = 0; i < (daily?.time?.length ?? 0); i++) {
@@ -167,12 +149,10 @@ async function getWetterWoche() {
       emoji: codes[daily.weathercode[i]] ?? '🌡️',
       max:   Math.round(daily.temperature_2m_max[i]),
       min:   Math.round(daily.temperature_2m_min[i]),
-      rain:  (daily.precipitation_sum[i] ?? 0).toFixed(1)
     };
   }
   return tage;
 }
-
 
 async function getPersonalTodos() {
   const dbId = process.env.NOTION_PERSONAL_DB_ID;
@@ -186,10 +166,7 @@ async function getPersonalTodos() {
     .filter(t => t.length > 0);
 }
 
-// ── Telegram ──────────────────────────────────────────────────────────────────
-
 async function sendTelegram(text) {
-  // Telegram-Limit: 4096 Zeichen pro Nachricht
   const chunks = [];
   while (text.length > 4000) {
     let cut = text.lastIndexOf('\n', 4000);
@@ -198,7 +175,6 @@ async function sendTelegram(text) {
     text = text.slice(cut);
   }
   chunks.push(text);
-
   for (const chunk of chunks) {
     const res = await post('api.telegram.org', `/bot${TELEGRAM_TOKEN}/sendMessage`, {
       chat_id: TELEGRAM_CHAT_ID,
@@ -209,11 +185,9 @@ async function sendTelegram(text) {
   }
 }
 
-// ── Hauptprogramm ─────────────────────────────────────────────────────────────
-
 async function main() {
   const istNaechsteWoche = WOCHE_INPUT === 'naechste';
-  const { montag, freitag, montagDate } = wochenbereich(istNaechsteWoche ? 1 : 0);
+  const { montag, freitag } = wochenbereich(istNaechsteWoche ? 1 : 0);
 
   console.log(`📅 Wochenausblick: ${montag} bis ${freitag} (${WOCHE_INPUT} Woche)`);
 
@@ -225,32 +199,23 @@ async function main() {
   ]);
 
   const wochenLabel = istNaechsteWoche ? 'nächste Woche' : 'diese Woche';
-  const montagFmt   = formatKurzdatum(montag);
-  const freitagFmt  = formatKurzdatum(freitag);
-
   let msg = `📅 <b>Wochenausblick – ${wochenLabel}</b>\n`;
-  msg += `<b>${montagFmt} – ${freitagFmt}</b>\n\n`;
+  msg += `<b>${formatKurzdatum(montag)} – ${formatKurzdatum(freitag)}</b>\n\n`;
 
   const wochentage = ['Montag','Dienstag','Mittwoch','Donnerstag','Freitag'];
-
   for (let i = 0; i < 5; i++) {
     const datum   = addTage(montag, i);
     const stunden = stundenplan[datum] || [];
     const wetter  = wetterMap[datum];
-    const tagLabel = wochentage[i];
-    const datumFmt = formatKurzdatum(datum);
-
-    // Tages-Header
     const wetterStr = wetter ? ` ${wetter.emoji} ↑${wetter.max}° ↓${wetter.min}°` : '';
-    msg += `━━ <b>${tagLabel} ${datumFmt}</b>${wetterStr} ━━\n`;
-
+    msg += `━━ <b>${wochentage[i]} ${formatKurzdatum(datum)}</b>${wetterStr} ━━\n`;
     if (stunden.length === 0) {
       msg += `✨ Kein Unterricht\n`;
     } else {
       for (const s of stunden) {
-        const emoji = s.status === 'Ausfall'     ? '❌'
-                    : s.status === 'Vertretung'  ? '🔄'
-                    : s.status === 'Prüfung'     ? '📝'
+        const emoji = s.status === 'Ausfall'    ? '❌'
+                    : s.status === 'Vertretung' ? '🔄'
+                    : s.status === 'Prüfung'    ? '📝'
                     : '✅';
         msg += `${emoji} ${s.start}–${s.ende} <b>${s.fach}</b>`;
         if (s.raum) msg += ` · ${s.raum}`;
@@ -263,8 +228,8 @@ async function main() {
     msg += '\n';
   }
 
-  // Offene Aufgaben
-  msg += `✅ <b>Offene Aufgaben</b>\n`;
+  // Schulaufgaben
+  msg += `✅ <b>Offene Schulaufgaben</b>\n`;
   if (todos.length === 0) {
     msg += `🎉 Alles erledigt!\n`;
   } else {
@@ -280,13 +245,12 @@ async function main() {
     if (todos.length > 15) msg += `… und ${todos.length - 15} weitere\n`;
   }
 
-  
-  // Persönliche Aufgaben
-  if (personal.length > 0) {
-    msg += `\n🏠 <b>Persönliche Aufgaben</b>\n`;
-    for (const t of personal) {
-      msg += `☐ ${t}\n`;
-    }
+  // Persönliche Aufgaben – immer anzeigen
+  msg += `\n🏠 <b>Persönliche Aufgaben</b>\n`;
+  if (personal.length === 0) {
+    msg += `🎉 Nichts zu erledigen!\n`;
+  } else {
+    for (const t of personal) msg += `☐ ${t}\n`;
   }
 
   msg += `\n🚀 <i>Viel Erfolg ${wochenLabel}!</i>`;
