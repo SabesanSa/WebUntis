@@ -313,7 +313,7 @@ async function main() {
     }
   }
 
-  msg += `\n✅ <b>Offene Schulaufgaben</b>\n`;
+  msg += `\n✅ <b>Offene Aufgaben</b>\n`;
   if (todos.length === 0) {
     msg += `🎉 Alles erledigt!\n`;
   } else {
