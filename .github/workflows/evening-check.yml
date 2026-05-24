@@ -1,4 +1,4 @@
-name: ðŸŒ™ Abend-Check
+name: 🌙 Abend-Check
 
 on:
   schedule:
@@ -18,7 +18,7 @@ jobs:
         with:
           node-version: "24"
       - run: npm install
-      - name: ðŸŒ™ Abend-Check ausfÃ¼hren
+      - name: 🌙 Abend-Check ausführen
         env:
           NOTION_TOKEN:             ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID:       ${{ secrets.NOTION_DATABASE_ID }}
