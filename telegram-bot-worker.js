@@ -16,7 +16,6 @@ export default {
       const chatId = String(message.chat.id);
       const text   = message.text.trim();
 
-      // Sicherheit: nur der eigene Chat darf den Bot nutzen
       if (chatId !== String(env.TELEGRAM_CHAT_ID)) {
         return new Response('OK');
       }
@@ -30,50 +29,39 @@ export default {
   }
 };
 
-// ── Nachricht verarbeiten ─────────────────────────────────────────────────────
-
 async function handleNachricht(env, chatId, text) {
   const t = text.toLowerCase().trim();
 
-  // Befehle
   if (t === 'todos' || t === '/todos') {
     await sendeTodos(env, chatId);
     return;
   }
 
-  // ── NEU: Schulcheck manuell auslösen ────────────────────────────────────────
+  // DEBUG: Schulcheck mit vollem Fehlertext
   if (t === 'schulcheck' || t === '/schulcheck' || t === 'check') {
-    const res = await fetch(
-      `https://api.github.com/repos/${env.GITHUB_USERNAME}/stundenplan-sync/actions/workflows/morning-check.yml/dispatches`,
-      {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${env.GITHUB_TOKEN}`,
-          'Accept': 'application/vnd.github+json',
-          'Content-Type': 'application/json',
-          'User-Agent': 'schul-bot'
-        },
-        body: JSON.stringify({ ref: 'main' })
-      }
-    );
+    const url = `https://api.github.com/repos/${env.GITHUB_USERNAME}/stundenplan-sync/actions/workflows/morning-check.yml/dispatches`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${env.GITHUB_TOKEN}`,
+        'Accept': 'application/vnd.github+json',
+        'Content-Type': 'application/json',
+        'User-Agent': 'schul-bot'
+      },
+      body: JSON.stringify({ ref: 'main' })
+    });
 
-    if (res.status === 204) {
-      await sendeTelegram(env, chatId, '⏳ Schulcheck wird gestartet – Nachricht kommt in ~30 Sekunden!');
-    } else {
-      const err = await res.text();
-      console.error('GitHub API Fehler:', res.status, err);
-      await sendeTelegram(env, chatId, '❌ Schulcheck konnte nicht gestartet werden. GitHub Token prüfen.');
-    }
+    const statusCode = res.status;
+    const responseText = await res.text();
+    await sendeTelegram(env, chatId, `Status: ${statusCode}\nURL: ${url}\n\n${responseText}`);
     return;
   }
-  // ────────────────────────────────────────────────────────────────────────────
 
   if (t === 'hilfe' || t === '/hilfe' || t === '/start' || t === '/help') {
     await sendeTelegram(env, chatId, hilfeText());
     return;
   }
 
-  // Datum erkennen
   const datum = parseDatum(t);
   if (!datum) {
     await sendeTelegram(env, chatId,
@@ -85,14 +73,12 @@ async function handleNachricht(env, chatId, text) {
   await sendeStundenplan(env, chatId, datum);
 }
 
-// ── Datum parsen ──────────────────────────────────────────────────────────────
-
 function berlinHeute() {
   return new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Berlin' }));
 }
 
 function fmt(d) {
-  return d.toLocaleDateString('fr-CA'); // YYYY-MM-DD
+  return d.toLocaleDateString('fr-CA');
 }
 
 function formatAnzeige(dateStr) {
@@ -105,7 +91,6 @@ function formatAnzeige(dateStr) {
 function parseDatum(t) {
   const heute = berlinHeute();
 
-  // Relative Tage
   if (t === 'heute')       return fmt(heute);
   if (t === 'morgen') {
     const m = new Date(heute); m.setDate(m.getDate() + 1); return fmt(m);
@@ -114,7 +99,6 @@ function parseDatum(t) {
     const m = new Date(heute); m.setDate(m.getDate() + 2); return fmt(m);
   }
 
-  // Wochentage (zeigt nächstes Vorkommen ab heute)
   const wochentage = {
     'montag': 1, 'mo': 1,
     'dienstag': 2, 'di': 2,
@@ -134,7 +118,6 @@ function parseDatum(t) {
     return fmt(d);
   }
 
-  // DD.MM. oder DD.MM.YYYY
   const match = t.match(/^(\d{1,2})\.(\d{1,2})\.?(\d{4})?$/);
   if (match) {
     const tag   = parseInt(match[1]);
@@ -146,8 +129,6 @@ function parseDatum(t) {
 
   return null;
 }
-
-// ── Notion ────────────────────────────────────────────────────────────────────
 
 async function notionQuery(env, dbId, filter) {
   const payload = filter ? { filter, page_size: 100 } : { page_size: 100 };
@@ -243,7 +224,6 @@ async function sendeTodos(env, chatId) {
     }
   }
 
-  // Persönliche Todos
   if (env.NOTION_PERSONAL_DB_ID) {
     const rows = await notionQuery(env, env.NOTION_PERSONAL_DB_ID, {
       property: 'Erledigt',
@@ -262,8 +242,6 @@ async function sendeTodos(env, chatId) {
 
   await sendeTelegram(env, chatId, msg);
 }
-
-// ── Telegram ──────────────────────────────────────────────────────────────────
 
 async function sendeTelegram(env, chatId, text) {
   await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
