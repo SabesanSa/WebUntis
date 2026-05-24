@@ -259,6 +259,19 @@ async function getWetterMorgen() {
   };
 }
 
+
+async function getPersonalTodos() {
+  const dbId = process.env.NOTION_PERSONAL_DB_ID;
+  if (!dbId) return [];
+  const rows = await notionQuery(dbId, {
+    property: 'Erledigt',
+    checkbox: { equals: false }
+  });
+  return rows
+    .map(page => page.properties['Aufgabe']?.title?.[0]?.plain_text || '')
+    .filter(t => t.length > 0);
+}
+
 // ── Telegram ──────────────────────────────────────────────────────────────────
 
 async function sendTelegram(text) {
@@ -285,7 +298,7 @@ async function main() {
   // 3. Daten für den relevanten Schultag abrufen
   const zielDatum = naechsterTag.ersterSchultag;
 
-  const [stunden, todos, w] = await Promise.all([
+  const [stunden, todos, personal, w] = await Promise.all([
     getStundenplan(zielDatum).catch(e => { console.error('Stundenplan-Fehler:', e.message); return []; }),
     getTodos(naechsterTag.morgenDatum).catch(e => { console.error('Todo-Fehler:', e.message); return []; }),
     getWetterMorgen().catch(e => { console.error('Wetter-Fehler:', e.message); return null; })

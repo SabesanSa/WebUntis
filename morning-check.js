@@ -172,6 +172,18 @@ async function getTodos() {
     });
 }
 
+async function getPersonalTodos() {
+  const dbId = process.env.NOTION_PERSONAL_DB_ID;
+  if (!dbId) return [];
+  const rows = await notionQuery(dbId, {
+    property: 'Erledigt',
+    checkbox: { equals: false }
+  });
+  return rows
+    .map(page => page.properties['Aufgabe']?.title?.[0]?.plain_text || '')
+    .filter(t => t.length > 0);
+}
+
 // ── Wetter (Open-Meteo, kostenlos, kein API-Key) ───────────────────────────────
 
 async function getWetter() {
@@ -232,9 +244,10 @@ async function main() {
   }
 
   // 3. Daten abrufen
-  const [stunden, todos, w] = await Promise.all([
+  const [stunden, todos, personal, w] = await Promise.all([
     getStundenplan().catch(e => { console.error('Stundenplan-Fehler:', e.message); return []; }),
     getTodos().catch(e => { console.error('Todo-Fehler:', e.message); return []; }),
+    getPersonalTodos().catch(e => { console.error('Personal-Todo-Fehler:', e.message); return []; }),
     getWetter().catch(e => { console.error('Wetter-Fehler:', e.message); return null; })
   ]);
 
@@ -288,6 +301,14 @@ async function main() {
       msg += '\n';
     }
     if (todos.length > 20) msg += `… und ${todos.length - 20} weitere\n`;
+  }
+
+  // Persönliche Aufgaben
+  if (personal.length > 0) {
+    msg += `\n🏠 <b>Persönliche Aufgaben</b>\n`;
+    for (const t of personal) {
+      msg += `☐ ${t}\n`;
+    }
   }
 
   msg += `\n🚀 <i>Guten Schultag!</i>`;
