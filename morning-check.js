@@ -9,7 +9,7 @@ const TELEGRAM_CHAT_ID     = process.env.TELEGRAM_CHAT_ID;
 
 // ── Hilfsfunktionen ────────────────────────────────────────────────────────────
 
-function request(options, body) {
+function request(options) {
   return new Promise((resolve, reject) => {
     const req = https.request(options, res => {
       let data = '';
@@ -19,14 +19,36 @@ function request(options, body) {
       });
     });
     req.on('error', reject);
-    if (body) req.write(body);
+    if (options._body) req.write(options._body);
     req.end();
   });
 }
 
-// Gibt "YYYY-MM-DD" in der Berliner Zeitzone zurück
+function post(hostname, path, body, extraHeaders = {}) {
+  const raw = JSON.stringify(body);
+  return request({
+    hostname, path, method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(raw),
+      ...extraHeaders
+    },
+    _body: raw
+  });
+}
+
+function get(hostname, path) {
+  return request({ hostname, path, method: 'GET' });
+}
+
+// Datum in Berliner Zeit als YYYY-MM-DD
 function today() {
   return new Date().toLocaleDateString('fr-CA', { timeZone: 'Europe/Berlin' });
+}
+
+// Aktuelle Stunde in Berliner Zeit
+function berlinHour() {
+  return new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Berlin' })).getHours();
 }
 
 function formatDate() {
@@ -36,22 +58,71 @@ function formatDate() {
   return `${wochentage[d.getDay()]}, ${d.getDate()}. ${monate[d.getMonth()]}`;
 }
 
+// ── Zeitzonencheck: nur um 6 Uhr Berliner Zeit ausführen ──────────────────────
+
+function checkUhrzeit() {
+  if (process.env.GITHUB_EVENT_NAME === 'workflow_dispatch') {
+    console.log('⚡ Manuell ausgelöst – Uhrzeitcheck übersprungen.');
+    return;
+  }
+  const stunde = berlinHour();
+  if (stunde !== 6) {
+    console.log(`⏰ Berliner Zeit: ${stunde} Uhr – kein 6-Uhr-Slot, wird übersprungen.`);
+    process.exit(0);
+  }
+  console.log('⏰ 6 Uhr Berlin – Schul-Check startet.');
+}
+
+// ── Feriencheck (NRW via ferien-api.de) ───────────────────────────────────────
+
+async function checkFerien() {
+  const jahr = new Date().getFullYear();
+  const todayStr = today();
+
+  let ferien = [];
+  try {
+    // Aktuelles und nächstes Jahr abrufen, damit Silvester/Neujahr abgedeckt ist
+    const [aktJahr, naechstesJahr] = await Promise.all([
+      get('ferien-api.de', `/api/v1/holidays/NW/${jahr}`),
+      get('ferien-api.de', `/api/v1/holidays/NW/${jahr + 1}`)
+    ]);
+    ferien = [...(Array.isArray(aktJahr) ? aktJahr : []), ...(Array.isArray(naechstesJahr) ? naechstesJahr : [])];
+  } catch (e) {
+    console.warn('⚠️ Ferien-API nicht erreichbar – Check läuft trotzdem.');
+    return { inFerien: false, letzterTag: false, name: null };
+  }
+
+  for (const f of ferien) {
+    const start    = f.start.split('T')[0];
+    const endExkl  = f.end.split('T')[0]; // Erster Schultag nach den Ferien
+
+    if (todayStr >= start && todayStr < endExkl) {
+      // Letzter Ferientag = endExkl - 1 Tag
+      const letzterTagDate = new Date(endExkl);
+      letzterTagDate.setDate(letzterTagDate.getDate() - 1);
+      const letzterTag = letzterTagDate.toISOString().split('T')[0];
+
+      if (todayStr === letzterTag) {
+        console.log(`📅 Letzter Ferientag (${f.name}) – Check läuft!`);
+        return { inFerien: true, letzterTag: true, name: f.name };
+      } else {
+        console.log(`🏖️ Ferientag (${f.name}) – Check wird übersprungen.`);
+        return { inFerien: true, letzterTag: false, name: f.name };
+      }
+    }
+  }
+
+  return { inFerien: false, letzterTag: false, name: null };
+}
+
 // ── Notion ─────────────────────────────────────────────────────────────────────
 
 async function notionQuery(dbId, filter) {
   const payload = filter ? { filter } : {};
-  const body = JSON.stringify(payload);
-  const res = await request({
-    hostname: 'api.notion.com',
-    path: `/v1/databases/${dbId}/query`,
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${NOTION_TOKEN}`,
-      'Notion-Version': '2022-06-28',
-      'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(body)
-    }
-  }, body);
+  const res = await post('api.notion.com', `/v1/databases/${dbId}/query`, payload, {
+    'Authorization': `Bearer ${NOTION_TOKEN}`,
+    'Notion-Version': '2022-06-28'
+  });
   if (res.object === 'error') throw new Error(res.message);
   return res.results || [];
 }
@@ -75,8 +146,6 @@ async function getStundenplan() {
 
 async function getTodos() {
   if (!NOTION_TODO_DB) return [];
-
-  // Nur nicht-erledigte Aufgaben abrufen (Status != "Erledigt")
   const rows = await notionQuery(NOTION_TODO_DB, {
     property: 'Status',
     select: { does_not_equal: 'Erledigt' }
@@ -96,7 +165,6 @@ async function getTodos() {
     })
     .filter(t => t.title.length > 0)
     .sort((a, b) => {
-      // Sortierung: zuerst nach Fälligkeit, dann nach Priorität
       if (a.faellig && b.faellig) return a.faellig.localeCompare(b.faellig);
       if (a.faellig) return -1;
       if (b.faellig) return 1;
@@ -107,18 +175,13 @@ async function getTodos() {
 // ── Wetter (Open-Meteo, kostenlos, kein API-Key) ───────────────────────────────
 
 async function getWetter() {
-  // Dortmund: 51.5136° N, 7.4653° O
-  const res = await request({
-    hostname: 'api.open-meteo.com',
-    path: [
-      '/v1/forecast',
-      '?latitude=51.5136&longitude=7.4653',
-      '&current=temperature_2m,weathercode,windspeed_10m',
-      '&daily=temperature_2m_max,temperature_2m_min,precipitation_sum',
-      '&timezone=Europe%2FBerlin&forecast_days=1'
-    ].join(''),
-    method: 'GET'
-  });
+  const res = await get('api.open-meteo.com', [
+    '/v1/forecast',
+    '?latitude=51.5136&longitude=7.4653',
+    '&current=temperature_2m,weathercode,windspeed_10m',
+    '&daily=temperature_2m_max,temperature_2m_min,precipitation_sum',
+    '&timezone=Europe%2FBerlin&forecast_days=1'
+  ].join(''));
 
   const codes = {
     0:'☀️ Klar', 1:'🌤️ Überwiegend klar', 2:'⛅ Teilweise bewölkt', 3:'☁️ Bedeckt',
@@ -143,35 +206,47 @@ async function getWetter() {
 // ── Telegram ───────────────────────────────────────────────────────────────────
 
 async function sendTelegram(text) {
-  const body = JSON.stringify({
+  const res = await post('api.telegram.org', `/bot${TELEGRAM_TOKEN}/sendMessage`, {
     chat_id: TELEGRAM_CHAT_ID,
     text,
     parse_mode: 'HTML'
   });
-  return request({
-    hostname: 'api.telegram.org',
-    path: `/bot${TELEGRAM_TOKEN}/sendMessage`,
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(body)
-    }
-  }, body);
+  return res;
 }
 
 // ── Hauptprogramm ──────────────────────────────────────────────────────────────
 
 async function main() {
-  console.log('🌅 Schul-Check startet...');
+  // 1. Nur um 6 Uhr Berliner Zeit ausführen
+  checkUhrzeit();
 
+  // 2. Feriencheck
+  const ferien = await checkFerien().catch(e => {
+    console.warn('Feriencheck fehlgeschlagen:', e.message);
+    return { inFerien: false, letzterTag: false, name: null };
+  });
+
+  if (ferien.inFerien && !ferien.letzterTag) {
+    console.log('🏖️ Ferien – kein Check heute.');
+    process.exit(0);
+  }
+
+  // 3. Daten abrufen
   const [stunden, todos, w] = await Promise.all([
     getStundenplan().catch(e => { console.error('Stundenplan-Fehler:', e.message); return []; }),
     getTodos().catch(e => { console.error('Todo-Fehler:', e.message); return []; }),
     getWetter().catch(e => { console.error('Wetter-Fehler:', e.message); return null; })
   ]);
 
-  // ── Nachricht zusammenbauen ─────────────────────────────────────────────────
-  let msg = `🎒 <b>Schul-Check – ${formatDate()}</b>\n\n`;
+  // 4. Nachricht zusammenbauen
+  let msg = `🎒 <b>Schul-Check – ${formatDate()}</b>\n`;
+
+  // Letzter Ferientag – Hinweis
+  if (ferien.letzterTag) {
+    msg += `🏖️ <i>Letzter Ferientag (${ferien.name}) – morgen geht's wieder los!</i>\n`;
+  }
+
+  msg += '\n';
 
   // Wetter
   if (w) {
@@ -186,12 +261,12 @@ async function main() {
     msg += `✨ Kein Unterricht – freier Tag!\n`;
   } else {
     for (const s of stunden) {
-      const emoji = s.status.includes('Ausfall')     ? '❌'
-                  : s.status.includes('Vertretung')  ? '🔄'
+      const emoji = s.status.includes('Ausfall')    ? '❌'
+                  : s.status.includes('Vertretung') ? '🔄'
                   : '✅';
       msg += `${emoji} <b>${s.start}–${s.ende}</b> ${s.fach}`;
       if (s.raum) msg += ` · ${s.raum}`;
-      if (s.status.includes('Ausfall'))    msg += ` <i>(Ausfall)</i>`;
+      if (s.status.includes('Ausfall'))         msg += ` <i>(Ausfall)</i>`;
       else if (s.status.includes('Vertretung')) msg += ` <i>(Vertretung)</i>`;
       msg += '\n';
     }
@@ -203,21 +278,21 @@ async function main() {
     msg += `🎉 Alles erledigt!\n`;
   } else {
     const prioritaetEmoji = { 'Hoch': '🔴', 'Mittel': '🟡', 'Niedrig': '🟢' };
-    for (const t of todos.slice(0, 8)) {
+    for (const t of todos.slice(0, 20)) {
       const prio = prioritaetEmoji[t.prioritaet] || '•';
       msg += `${prio} ${t.title}`;
       if (t.faellig) {
         const d = new Date(t.faellig);
-        msg += ` <i>(fällig ${d.getDate()}.${d.getMonth()+1}.)</i>`;
+        msg += ` <i>(fällig ${d.getDate()}.${d.getMonth() + 1}.)</i>`;
       }
       msg += '\n';
     }
-    if (todos.length > 8) msg += `… und ${todos.length - 8} weitere\n`;
+    if (todos.length > 20) msg += `… und ${todos.length - 20} weitere\n`;
   }
 
   msg += `\n🚀 <i>Guten Schultag!</i>`;
 
-  // Senden
+  // 5. Senden
   const result = await sendTelegram(msg);
   if (result.ok) {
     console.log('✅ Schul-Check erfolgreich gesendet!');
