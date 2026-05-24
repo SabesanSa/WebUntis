@@ -121,17 +121,39 @@ async function getPersonalTodos() {
 }
 
 async function getAccessToken() {
-  const body = new URLSearchParams({
-    client_id:     process.env.GOOGLE_CLIENT_ID,
-    client_secret: process.env.GOOGLE_CLIENT_SECRET,
-    refresh_token: process.env.GOOGLE_REFRESH_TOKEN,
-    grant_type:    'refresh_token'
-  }).toString();
+  const clientId     = (process.env.GOOGLE_CLIENT_ID     || '').trim();
+  const clientSecret = (process.env.GOOGLE_CLIENT_SECRET || '').trim();
+  const refreshToken = (process.env.GOOGLE_REFRESH_TOKEN || '').trim();
 
-  const res = await post('oauth2.googleapis.com', '/token', null, {}, body, 'application/x-www-form-urlencoded');
-  console.log('🔑 Access Token Antwort:', JSON.stringify(res).substring(0, 100));
-  if (!res.access_token) throw new Error('Kein access_token: ' + JSON.stringify(res));
-  return res.access_token;
+  console.log('🔑 Refresh Token Ende:', refreshToken.slice(-10));
+
+  const body = `client_id=${encodeURIComponent(clientId)}&client_secret=${encodeURIComponent(clientSecret)}&refresh_token=${encodeURIComponent(refreshToken)}&grant_type=refresh_token`;
+
+  return new Promise((resolve, reject) => {
+    const req = https.request({
+      hostname: 'oauth2.googleapis.com',
+      path: '/token',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(body)
+      }
+    }, res => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          console.log('🔑 Token Antwort:', JSON.stringify(parsed).substring(0, 120));
+          if (!parsed.access_token) reject(new Error('Kein access_token: ' + data));
+          else resolve(parsed.access_token);
+        } catch(e) { reject(e); }
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
 }
 
 async function getKalenderTermine(datum, accessToken) {
