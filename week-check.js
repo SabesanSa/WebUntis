@@ -217,7 +217,7 @@ async function main() {
 
   console.log(`📅 Wochenausblick: ${montag} bis ${freitag} (${WOCHE_INPUT} Woche)`);
 
-  const [stundenplan, todos, wetterMap] = await Promise.all([
+  const [stundenplan, todos, personal, wetterMap] = await Promise.all([
     getWochenplan(montag, freitag).catch(e => { console.error('Stundenplan-Fehler:', e.message); return {}; }),
     getTodos().catch(e => { console.error('Todo-Fehler:', e.message); return []; }),
     getPersonalTodos().catch(e => { console.error('Personal-Fehler:', e.message); return []; }),
