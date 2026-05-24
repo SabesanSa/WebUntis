@@ -39,7 +39,7 @@ async function handleNachricht(env, chatId, text) {
 
   // DEBUG: Schulcheck mit vollem Fehlertext
   if (t === 'schulcheck' || t === '/schulcheck' || t === 'check') {
-    const url = `https://api.github.com/repos/${env.GITHUB_USERNAME}/stundenplan-sync/actions/workflows/morning-check.yml/dispatches`;
+    const url = `https://api.github.com/repos/${env.GITHUB_USERNAME}/WebUntis/actions/workflows/morning-check.yml/dispatches`;
     const res = await fetch(url, {
       method: 'POST',
       headers: {
