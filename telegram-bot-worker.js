@@ -59,7 +59,7 @@ async function handleNachricht(env, chatId, text) {
     return;
   }
 
-  if (t === 'wochencheck' || t === '/wochencheck') {
+  if (t === 'wochencheck' || t === '/wochencheck' || t === 'diese woche') {
     const res = await fetch(
       `https://api.github.com/repos/${env.GITHUB_USERNAME}/WebUntis/actions/workflows/week-check.yml/dispatches`,
       {
@@ -70,11 +70,33 @@ async function handleNachricht(env, chatId, text) {
           'Content-Type': 'application/json',
           'User-Agent': 'schul-bot'
         },
-        body: JSON.stringify({ ref: 'main' })
+        body: JSON.stringify({ ref: 'main', inputs: { woche: 'diese' } })
       }
     );
     if (res.status === 204) {
-      await sendeTelegram(env, chatId, '📅 Wochencheck wird gestartet – Nachricht kommt in ~30 Sekunden!');
+      await sendeTelegram(env, chatId, '📅 Wochencheck (diese Woche) wird gestartet – Nachricht kommt in ~30 Sekunden!');
+    } else {
+      await sendeTelegram(env, chatId, '❌ Wochencheck konnte nicht gestartet werden.');
+    }
+    return;
+  }
+
+  if (t === 'nächstewoche' || t === 'naechstewoche' || t === 'nächste woche' || t === '/nächstewoche') {
+    const res = await fetch(
+      `https://api.github.com/repos/${env.GITHUB_USERNAME}/WebUntis/actions/workflows/week-check.yml/dispatches`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${env.GITHUB_TOKEN}`,
+          'Accept': 'application/vnd.github+json',
+          'Content-Type': 'application/json',
+          'User-Agent': 'schul-bot'
+        },
+        body: JSON.stringify({ ref: 'main', inputs: { woche: 'nächste' } })
+      }
+    );
+    if (res.status === 204) {
+      await sendeTelegram(env, chatId, '📅 Wochencheck (nächste Woche) wird gestartet – Nachricht kommt in ~30 Sekunden!');
     } else {
       await sendeTelegram(env, chatId, '❌ Wochencheck konnte nicht gestartet werden.');
     }
@@ -89,7 +111,7 @@ async function handleNachricht(env, chatId, text) {
   const datum = parseDatum(t);
   if (!datum) {
     await sendeTelegram(env, chatId,
-      `❓ Ich verstehe das nicht.\n\nSchreib z.B.:\n• <b>heute</b>\n• <b>morgen</b>\n• <b>Donnerstag</b>\n• <b>27.5.</b>\n• <b>todos</b>\n• <b>schulcheck</b>\n• <b>wochencheck</b>\n• <b>hilfe</b>`
+      `❓ Ich verstehe das nicht.\n\nSchreib z.B.:\n• <b>heute</b>\n• <b>morgen</b>\n• <b>Donnerstag</b>\n• <b>27.5.</b>\n• <b>todos</b>\n• <b>schulcheck</b>\n• <b>wochencheck</b>\n• <b>nächste Woche</b>\n• <b>hilfe</b>`
     );
     return;
   }
@@ -293,7 +315,8 @@ function hilfeText() {
 
 🔄 <b>Checks:</b>
 • <b>schulcheck</b> – Tages-Check jetzt ausführen
-• <b>wochencheck</b> – Wochen-Check jetzt ausführen
+• <b>wochencheck</b> – Wochencheck diese Woche
+• <b>nächste Woche</b> – Wochencheck nächste Woche
 
 ❓ <b>hilfe</b> – diese Übersicht`;
 }
