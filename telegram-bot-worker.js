@@ -37,23 +37,47 @@ async function handleNachricht(env, chatId, text) {
     return;
   }
 
-  // DEBUG: Schulcheck mit vollem Fehlertext
   if (t === 'schulcheck' || t === '/schulcheck' || t === 'check') {
-    const url = `https://api.github.com/repos/${env.GITHUB_USERNAME}/WebUntis/actions/workflows/morning-check.yml/dispatches`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${env.GITHUB_TOKEN}`,
-        'Accept': 'application/vnd.github+json',
-        'Content-Type': 'application/json',
-        'User-Agent': 'schul-bot'
-      },
-      body: JSON.stringify({ ref: 'main' })
-    });
+    const res = await fetch(
+      `https://api.github.com/repos/${env.GITHUB_USERNAME}/WebUntis/actions/workflows/morning-check.yml/dispatches`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${env.GITHUB_TOKEN}`,
+          'Accept': 'application/vnd.github+json',
+          'Content-Type': 'application/json',
+          'User-Agent': 'schul-bot'
+        },
+        body: JSON.stringify({ ref: 'main' })
+      }
+    );
+    if (res.status === 204) {
+      await sendeTelegram(env, chatId, '⏳ Schulcheck wird gestartet – Nachricht kommt in ~30 Sekunden!');
+    } else {
+      await sendeTelegram(env, chatId, '❌ Schulcheck konnte nicht gestartet werden.');
+    }
+    return;
+  }
 
-    const statusCode = res.status;
-    const responseText = await res.text();
-    await sendeTelegram(env, chatId, `Status: ${statusCode}\nURL: ${url}\n\n${responseText}`);
+  if (t === 'wochencheck' || t === '/wochencheck') {
+    const res = await fetch(
+      `https://api.github.com/repos/${env.GITHUB_USERNAME}/WebUntis/actions/workflows/week-check.yml/dispatches`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${env.GITHUB_TOKEN}`,
+          'Accept': 'application/vnd.github+json',
+          'Content-Type': 'application/json',
+          'User-Agent': 'schul-bot'
+        },
+        body: JSON.stringify({ ref: 'main' })
+      }
+    );
+    if (res.status === 204) {
+      await sendeTelegram(env, chatId, '📅 Wochencheck wird gestartet – Nachricht kommt in ~30 Sekunden!');
+    } else {
+      await sendeTelegram(env, chatId, '❌ Wochencheck konnte nicht gestartet werden.');
+    }
     return;
   }
 
@@ -65,7 +89,7 @@ async function handleNachricht(env, chatId, text) {
   const datum = parseDatum(t);
   if (!datum) {
     await sendeTelegram(env, chatId,
-      `❓ Ich verstehe das nicht.\n\nSchreib z.B.:\n• <b>heute</b>\n• <b>morgen</b>\n• <b>Donnerstag</b>\n• <b>27.5.</b>\n• <b>todos</b>\n• <b>schulcheck</b>\n• <b>hilfe</b>`
+      `❓ Ich verstehe das nicht.\n\nSchreib z.B.:\n• <b>heute</b>\n• <b>morgen</b>\n• <b>Donnerstag</b>\n• <b>27.5.</b>\n• <b>todos</b>\n• <b>schulcheck</b>\n• <b>wochencheck</b>\n• <b>hilfe</b>`
     );
     return;
   }
@@ -267,8 +291,9 @@ function hilfeText() {
 ✅ <b>Aufgaben:</b>
 • <b>todos</b> – alle offenen Aufgaben
 
-🔄 <b>Schulcheck:</b>
-• <b>schulcheck</b> – Morgen-Check jetzt ausführen
+🔄 <b>Checks:</b>
+• <b>schulcheck</b> – Tages-Check jetzt ausführen
+• <b>wochencheck</b> – Wochen-Check jetzt ausführen
 
 ❓ <b>hilfe</b> – diese Übersicht`;
 }
