@@ -7,7 +7,7 @@ const NOTION_TODO_DB     = process.env.NOTION_TODO_DATABASE_ID;
 const TELEGRAM_TOKEN     = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
 
-// ── Hilfsfunktionen ────────────────────────────────────────────────────────────
+const IGNORIEREN = ['AG Bienen', 'Vertiefung'];
 
 function request(options) {
   return new Promise((resolve, reject) => {
@@ -41,14 +41,12 @@ function get(hostname, path) {
   return request({ hostname, path, method: 'GET' });
 }
 
-// Gibt ein Datum als YYYY-MM-DD zurück, +tage Tage ab heute (Berliner Zeit)
 function datumPlus(tage) {
   const d = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Berlin' }));
   d.setDate(d.getDate() + tage);
   return d.toLocaleDateString('fr-CA');
 }
 
-// Nächsten Wochentag (Mo–Fr) ab einem gegebenen YYYY-MM-DD berechnen
 function naechsterWochentag(vonDatum, schritte = 1) {
   const d = new Date(vonDatum + 'T12:00:00');
   d.setDate(d.getDate() + schritte);
@@ -58,7 +56,6 @@ function naechsterWochentag(vonDatum, schritte = 1) {
   return d.toLocaleDateString('fr-CA');
 }
 
-// Vortag eines Datums
 function vortag(datum) {
   const d = new Date(datum + 'T12:00:00');
   d.setDate(d.getDate() - 1);
@@ -72,7 +69,6 @@ function formatDatum(dateStr) {
   return `${wochentage[d.getDay()]}, ${d.getDate()}. ${monate[d.getMonth()]}`;
 }
 
-// Aktuelle Stunde in Berliner Zeit
 function berlinHour() {
   return new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Berlin' })).getHours();
 }
@@ -80,8 +76,6 @@ function berlinHour() {
 function heute() {
   return new Date().toLocaleDateString('fr-CA', { timeZone: 'Europe/Berlin' });
 }
-
-// ── Zeitzonencheck: nur um 20 Uhr Berliner Zeit ───────────────────────────────
 
 function checkUhrzeit() {
   if (process.env.GITHUB_EVENT_NAME === 'workflow_dispatch') {
@@ -95,8 +89,6 @@ function checkUhrzeit() {
   }
   console.log('⏰ 16 Uhr Berlin – Abend-Check startet.');
 }
-
-// ── Ferien laden (NRW) ────────────────────────────────────────────────────────
 
 async function ladeFerien() {
   const jahr = new Date().getFullYear();
@@ -115,48 +107,32 @@ async function ladeFerien() {
   }
 }
 
-// Gibt Ferieninfo zurück wenn das Datum in Ferien liegt, sonst null
 function inFerien(datum, ferienListe) {
   for (const f of ferienListe) {
     const start   = f.start.split('T')[0];
-    const endExkl = f.end.split('T')[0]; // erster Schultag
+    const endExkl = f.end.split('T')[0];
     if (datum >= start && datum < endExkl) {
       const letzterTag = vortag(endExkl);
-      return {
-        name:       f.name,
-        start,
-        endExkl,
-        letzterTag,
-        ersterSchultag: endExkl
-      };
+      return { name: f.name, start, endExkl, letzterTag, ersterSchultag: endExkl };
     }
   }
   return null;
 }
 
-// Analysiert was morgen / nächsten Werktag passiert
 function analysiereNaechsterTag(ferien) {
-  const morgenWochentag = naechsterWochentag(heute());  // nächster Mo-Fr
-
+  const morgenWochentag = naechsterWochentag(heute());
   const morgenFerien = inFerien(morgenWochentag, ferien);
-
-  // Finde ersten echten Schultag (nicht in Ferien)
   let ersterSchultag = morgenWochentag;
   let aktFerien = morgenFerien;
-  let maxLoops = 60; // Sicherheitsnetz gegen Endlosschleife
+  let maxLoops = 60;
   while (aktFerien && maxLoops-- > 0) {
     ersterSchultag = naechsterWochentag(ersterSchultag);
     aktFerien = inFerien(ersterSchultag, ferien);
   }
-
-  // Ist morgen der erste Tag nach den Ferien?
   const gestrigWochentag = vortag(morgenWochentag);
   const gesternInFerien  = inFerien(gestrigWochentag, ferien);
-
-  // Beginnen morgen Ferien? (heute letzter Schultag)
   const heuteFerien = inFerien(heute(), ferien);
   const morgenStartetFerien = !heuteFerien && morgenFerien !== null;
-
   return {
     morgenDatum:      morgenWochentag,
     morgenFrei:       morgenFerien !== null,
@@ -166,8 +142,6 @@ function analysiereNaechsterTag(ferien) {
     ferienStarten:    morgenStartetFerien
   };
 }
-
-// ── Notion ────────────────────────────────────────────────────────────────────
 
 async function notionQuery(dbId, filter) {
   const payload = filter ? { filter } : {};
@@ -184,16 +158,19 @@ async function getStundenplan(datum) {
     property: 'Datum',
     date: { equals: datum }
   });
-  return rows.map(page => {
-    const p = page.properties;
-    return {
-      fach:   p.Fach?.title?.[0]?.plain_text || '?',
-      start:  p.Startzeit?.rich_text?.[0]?.plain_text || '',
-      ende:   p.Endzeit?.rich_text?.[0]?.plain_text || '',
-      raum:   p.Raum?.rich_text?.[0]?.plain_text || '',
-      status: p.Status?.select?.name || 'Normal 🟢'
-    };
-  }).sort((a, b) => a.start.localeCompare(b.start));
+  return rows
+    .map(page => {
+      const p = page.properties;
+      return {
+        fach:   p.Fach?.title?.[0]?.plain_text || '?',
+        start:  p.Startzeit?.rich_text?.[0]?.plain_text || '',
+        ende:   p.Endzeit?.rich_text?.[0]?.plain_text || '',
+        raum:   p.Raum?.rich_text?.[0]?.plain_text || '',
+        status: p.Status?.select?.name || 'Normal 🟢'
+      };
+    })
+    .filter(s => !IGNORIEREN.includes(s.fach))
+    .sort((a, b) => a.start.localeCompare(b.start));
 }
 
 async function getTodos(morgenDatum) {
@@ -202,9 +179,7 @@ async function getTodos(morgenDatum) {
     property: 'Status',
     select: { does_not_equal: 'Erledigt' }
   });
-
   const prioritaetOrder = { 'Hoch': 0, 'Mittel': 1, 'Niedrig': 2, '': 3 };
-
   return rows
     .map(page => {
       const p = page.properties;
@@ -217,7 +192,6 @@ async function getTodos(morgenDatum) {
     })
     .filter(t => t.title.length > 0)
     .sort((a, b) => {
-      // Morgen-Fällige zuerst
       const aIstMorgen = a.faellig === morgenDatum;
       const bIstMorgen = b.faellig === morgenDatum;
       if (aIstMorgen && !bIstMorgen) return -1;
@@ -228,37 +202,6 @@ async function getTodos(morgenDatum) {
       return (prioritaetOrder[a.prioritaet] ?? 3) - (prioritaetOrder[b.prioritaet] ?? 3);
     });
 }
-
-// ── Wetter morgen (Open-Meteo, Index 1 = morgen) ─────────────────────────────
-
-async function getWetterMorgen() {
-  const res = await get('api.open-meteo.com', [
-    '/v1/forecast',
-    '?latitude=51.5136&longitude=7.4653',
-    '&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,weathercode',
-    '&timezone=Europe%2FBerlin&forecast_days=2'
-  ].join(''));
-
-  const codes = {
-    0:'☀️ Klar', 1:'🌤️ Überwiegend klar', 2:'⛅ Teilweise bewölkt', 3:'☁️ Bedeckt',
-    45:'🌫️ Nebel', 48:'🌫️ Raureif-Nebel',
-    51:'🌦️ Nieselregen', 53:'🌦️ Nieselregen', 55:'🌧️ Starker Nieselregen',
-    61:'🌧️ Leichter Regen', 63:'🌧️ Regen', 65:'🌧️ Starker Regen',
-    71:'❄️ Leichter Schnee', 73:'❄️ Schnee', 75:'❄️ Starker Schnee',
-    80:'🌦️ Schauer', 81:'🌧️ Schauer', 82:'⛈️ Starke Schauer',
-    95:'⛈️ Gewitter', 96:'⛈️ Gewitter mit Hagel', 99:'⛈️ Schweres Gewitter'
-  };
-
-  // Index 1 = morgen
-  const daily = res.daily;
-  return {
-    desc: codes[daily?.weathercode?.[1]] ?? '🌡️',
-    max:  Math.round(daily?.temperature_2m_max?.[1] ?? 0),
-    min:  Math.round(daily?.temperature_2m_min?.[1] ?? 0),
-    rain: (daily?.precipitation_sum?.[1] ?? 0).toFixed(1)
-  };
-}
-
 
 async function getPersonalTodos() {
   const dbId = process.env.NOTION_PERSONAL_DB_ID;
@@ -272,7 +215,30 @@ async function getPersonalTodos() {
     .filter(t => t.length > 0);
 }
 
-// ── Telegram ──────────────────────────────────────────────────────────────────
+async function getWetterMorgen() {
+  const res = await get('api.open-meteo.com', [
+    '/v1/forecast',
+    '?latitude=51.5136&longitude=7.4653',
+    '&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,weathercode',
+    '&timezone=Europe%2FBerlin&forecast_days=2'
+  ].join(''));
+  const codes = {
+    0:'☀️ Klar', 1:'🌤️ Überwiegend klar', 2:'⛅ Teilweise bewölkt', 3:'☁️ Bedeckt',
+    45:'🌫️ Nebel', 48:'🌫️ Raureif-Nebel',
+    51:'🌦️ Nieselregen', 53:'🌦️ Nieselregen', 55:'🌧️ Starker Nieselregen',
+    61:'🌧️ Leichter Regen', 63:'🌧️ Regen', 65:'🌧️ Starker Regen',
+    71:'❄️ Leichter Schnee', 73:'❄️ Schnee', 75:'❄️ Starker Schnee',
+    80:'🌦️ Schauer', 81:'🌧️ Schauer', 82:'⛈️ Starke Schauer',
+    95:'⛈️ Gewitter', 96:'⛈️ Gewitter mit Hagel', 99:'⛈️ Schweres Gewitter'
+  };
+  const daily = res.daily;
+  return {
+    desc: codes[daily?.weathercode?.[1]] ?? '🌡️',
+    max:  Math.round(daily?.temperature_2m_max?.[1] ?? 0),
+    min:  Math.round(daily?.temperature_2m_min?.[1] ?? 0),
+    rain: (daily?.precipitation_sum?.[1] ?? 0).toFixed(1)
+  };
+}
 
 async function sendTelegram(text) {
   return post('api.telegram.org', `/bot${TELEGRAM_TOKEN}/sendMessage`, {
@@ -282,43 +248,34 @@ async function sendTelegram(text) {
   });
 }
 
-// ── Hauptprogramm ─────────────────────────────────────────────────────────────
-
 async function main() {
-  // 1. Nur um 20 Uhr Berliner Zeit
   checkUhrzeit();
 
-  // 2. Ferien laden & analysieren
   const ferienListe  = await ladeFerien();
   const naechsterTag = analysiereNaechsterTag(ferienListe);
 
   console.log('📅 Nächster Tag:', naechsterTag.morgenDatum,
     naechsterTag.morgenFrei ? '(Ferien)' : '(Schultag)');
 
-  // 3. Daten für den relevanten Schultag abrufen
   const zielDatum = naechsterTag.ersterSchultag;
 
   const [stunden, todos, personal, w] = await Promise.all([
     getStundenplan(zielDatum).catch(e => { console.error('Stundenplan-Fehler:', e.message); return []; }),
     getTodos(naechsterTag.morgenDatum).catch(e => { console.error('Todo-Fehler:', e.message); return []; }),
+    getPersonalTodos().catch(e => { console.error('Personal-Todo-Fehler:', e.message); return []; }),
     getWetterMorgen().catch(e => { console.error('Wetter-Fehler:', e.message); return null; })
   ]);
 
-  // 4. Nachricht aufbauen
   let msg = `🌙 <b>Abend-Check – Ausblick auf morgen</b>\n\n`;
 
-  // ── Ferienhinweis ──
   if (naechsterTag.ferienStarten) {
-    // Heute letzter Schultag, morgen beginnen Ferien
     const fi = naechsterTag.morgenFerienInfo;
     const letzterFerientag = fi ? fi.letzterTag : '';
     const d = letzterFerientag ? new Date(letzterFerientag + 'T12:00:00') : null;
     const bisStr = d ? `bis ${d.getDate()}.${d.getMonth() + 1}.` : '';
     msg += `🏖️ <b>Morgen beginnen die ${fi?.name ?? 'Ferien'}!</b> ${bisStr}\n`;
     msg += `Erster Schultag danach: <b>${formatDatum(zielDatum)}</b>\n\n`;
-
   } else if (naechsterTag.morgenFrei) {
-    // Morgen ist Ferientag
     const fi = naechsterTag.morgenFerienInfo;
     const d  = fi ? new Date(fi.letzterTag + 'T12:00:00') : null;
     const bisStr = d ? `bis ${d.getDate()}.${d.getMonth() + 1}.` : '';
@@ -327,25 +284,19 @@ async function main() {
       msg += `📅 Nächster Schultag: <b>${formatDatum(zielDatum)}</b>\n`;
     }
     msg += '\n';
-
   } else if (naechsterTag.nachFerien) {
-    // Morgen ist erster Schultag nach Ferien
     msg += `⚠️ <b>Morgen geht's wieder los nach den Ferien!</b>\n`;
     msg += `📅 <b>${formatDatum(zielDatum)}</b>\n\n`;
-
   } else {
-    // Normaler nächster Schultag
     msg += `📅 <b>${formatDatum(zielDatum)}</b>\n\n`;
   }
 
-  // ── Wetter morgen ──
   if (w) {
     msg += `🌤️ <b>Wetter Dortmund morgen</b>\n`;
     msg += `${w.desc}\n`;
     msg += `↑ ${w.max}° ↓ ${w.min}°  ·  💧 ${w.rain} mm\n\n`;
   }
 
-  // ── Stundenplan ──
   msg += `📚 <b>Stundenplan ${formatDatum(zielDatum)}</b>\n`;
   if (stunden.length === 0) {
     msg += `✨ Kein Unterricht eingetragen\n`;
@@ -362,15 +313,13 @@ async function main() {
     }
   }
 
-  // ── To-Dos ──
-  msg += `\n✅ <b>Offene Aufgaben</b>\n`;
+  msg += `\n✅ <b>Offene Schulaufgaben</b>\n`;
   if (todos.length === 0) {
     msg += `🎉 Alles erledigt!\n`;
   } else {
     const prioritaetEmoji = { 'Hoch': '🔴', 'Mittel': '🟡', 'Niedrig': '🟢' };
     for (const t of todos.slice(0, 20)) {
-      const prio = prioritaetEmoji[t.prioritaet] || '•';
-      msg += `${prio} ${t.title}`;
+      msg += `${prioritaetEmoji[t.prioritaet] || '•'} ${t.title}`;
       if (t.faellig === naechsterTag.morgenDatum) {
         msg += ` <b>⚠️ morgen fällig!</b>`;
       } else if (t.faellig) {
@@ -382,9 +331,15 @@ async function main() {
     if (todos.length > 20) msg += `… und ${todos.length - 20} weitere\n`;
   }
 
+  msg += `\n🏠 <b>Persönliche Aufgaben</b>\n`;
+  if (personal.length === 0) {
+    msg += `🎉 Nichts zu erledigen!\n`;
+  } else {
+    for (const t of personal) msg += `☐ ${t}\n`;
+  }
+
   msg += `\n🌙 <i>Schönen Nachmittag!</i>`;
 
-  // 5. Senden
   const result = await sendTelegram(msg);
   if (result.ok) {
     console.log('✅ Abend-Check erfolgreich gesendet!');
