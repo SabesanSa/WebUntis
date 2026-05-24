@@ -4,7 +4,7 @@ on:
   schedule:
     - cron: "0 4 * * 1-5"   # 6:00 Uhr MESZ (Sommer, UTC+2)
     - cron: "0 5 * * 1-5"   # 6:00 Uhr MEZ  (Winter, UTC+1)
-  workflow_dispatch:          # manuell auslösbar zum Testen
+  workflow_dispatch:
 
 jobs:
   schul-check:
@@ -12,16 +12,12 @@ jobs:
     runs-on: ubuntu-latest
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
-
       - run: npm install
-
       - name: 🌅 Schul-Check ausführen
         env:
           NOTION_TOKEN:             ${{ secrets.NOTION_TOKEN }}
@@ -30,4 +26,9 @@ jobs:
           TELEGRAM_BOT_TOKEN:       ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:         ${{ secrets.TELEGRAM_CHAT_ID }}
           NOTION_PERSONAL_DB_ID:    ${{ secrets.NOTION_PERSONAL_DB_ID }}
+          GOOGLE_CLIENT_ID:         ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET:     ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN:     ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          GOOGLE_CALENDAR_ID:       ${{ secrets.GOOGLE_CALENDAR_ID }}
+          GITHUB_EVENT_NAME:        ${{ github.event_name }}
         run: node morning-check.js
