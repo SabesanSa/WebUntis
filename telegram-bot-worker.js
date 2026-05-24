@@ -59,6 +59,28 @@ async function handleNachricht(env, chatId, text) {
     return;
   }
 
+  if (t === 'abendcheck' || t === '/abendcheck') {
+    const res = await fetch(
+      `https://api.github.com/repos/${env.GITHUB_USERNAME}/WebUntis/actions/workflows/evening-check.yml/dispatches`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${env.GITHUB_TOKEN}`,
+          'Accept': 'application/vnd.github+json',
+          'Content-Type': 'application/json',
+          'User-Agent': 'schul-bot'
+        },
+        body: JSON.stringify({ ref: 'main' })
+      }
+    );
+    if (res.status === 204) {
+      await sendeTelegram(env, chatId, '🌙 Abendcheck wird gestartet – Nachricht kommt in ~30 Sekunden!');
+    } else {
+      await sendeTelegram(env, chatId, '❌ Abendcheck konnte nicht gestartet werden.');
+    }
+    return;
+  }
+
   if (t === 'wochencheck' || t === '/wochencheck' || t === 'diese woche') {
     const res = await fetch(
       `https://api.github.com/repos/${env.GITHUB_USERNAME}/WebUntis/actions/workflows/week-check.yml/dispatches`,
@@ -315,6 +337,7 @@ function hilfeText() {
 
 🔄 <b>Checks:</b>
 • <b>schulcheck</b> – Tages-Check jetzt ausführen
+• <b>abendcheck</b> – Abend-Check jetzt ausführen
 • <b>wochencheck</b> – Wochencheck diese Woche
 • <b>nächste Woche</b> – Wochencheck nächste Woche
 
