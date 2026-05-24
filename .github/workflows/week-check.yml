@@ -2,10 +2,8 @@ name: 📅 Wochenausblick
 
 on:
   schedule:
-    # Jeden Sonntagabend automatisch für die kommende Woche
     - cron: "0 17 * * 0"   # 19:00 Uhr MESZ (Sommer, UTC+2)
     - cron: "0 18 * * 0"   # 19:00 Uhr MEZ  (Winter, UTC+1)
-
   workflow_dispatch:
     inputs:
       woche:
@@ -23,16 +21,12 @@ jobs:
     runs-on: ubuntu-latest
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
-
       - run: npm install
-
       - name: 📅 Wochenausblick ausführen
         env:
           NOTION_TOKEN:             ${{ secrets.NOTION_TOKEN }}
@@ -41,6 +35,9 @@ jobs:
           TELEGRAM_BOT_TOKEN:       ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:         ${{ secrets.TELEGRAM_CHAT_ID }}
           NOTION_PERSONAL_DB_ID:    ${{ secrets.NOTION_PERSONAL_DB_ID }}
-          # Bei manuellem Start: gewählte Woche; bei Auto-Trigger: immer "naechste"
+          GOOGLE_CLIENT_ID:         ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET:     ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN:     ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          GOOGLE_CALENDAR_ID:       ${{ secrets.GOOGLE_CALENDAR_ID }}
           WOCHE_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.woche || 'naechste' }}
         run: node week-check.js
