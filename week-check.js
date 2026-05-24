@@ -102,11 +102,7 @@ async function getTodos() {
   return rows
     .map(page => {
       const p = page.properties;
-      return {
-        title:      p['Aufgabe']?.title?.[0]?.plain_text || '',
-        prioritaet: p['Priorität']?.select?.name || '',
-        faellig:    p['Fällig']?.date?.start || ''
-      };
+      return { title: p['Aufgabe']?.title?.[0]?.plain_text || '', prioritaet: p['Priorität']?.select?.name || '', faellig: p['Fällig']?.date?.start || '' };
     })
     .filter(t => t.title.length > 0)
     .sort((a, b) => {
@@ -125,12 +121,16 @@ async function getPersonalTodos() {
 }
 
 async function getAccessToken() {
-  const res = await post('oauth2.googleapis.com', '/token', null, {}, new URLSearchParams({
+  const body = new URLSearchParams({
     client_id:     process.env.GOOGLE_CLIENT_ID,
     client_secret: process.env.GOOGLE_CLIENT_SECRET,
     refresh_token: process.env.GOOGLE_REFRESH_TOKEN,
     grant_type:    'refresh_token'
-  }).toString(), 'application/x-www-form-urlencoded');
+  }).toString();
+
+  const res = await post('oauth2.googleapis.com', '/token', null, {}, body, 'application/x-www-form-urlencoded');
+  console.log('🔑 Access Token Antwort:', JSON.stringify(res).substring(0, 100));
+  if (!res.access_token) throw new Error('Kein access_token: ' + JSON.stringify(res));
   return res.access_token;
 }
 
@@ -139,7 +139,9 @@ async function getKalenderTermine(datum, accessToken) {
   const start = encodeURIComponent(datum + 'T00:00:00+02:00');
   const end   = encodeURIComponent(datum + 'T23:59:59+02:00');
   const path  = `/calendar/v3/calendars/${calId}/events?timeMin=${start}&timeMax=${end}&singleEvents=true&orderBy=startTime`;
+
   const res = await get('www.googleapis.com', path, { 'Authorization': `Bearer ${accessToken}` });
+  console.log(`📅 Kalender ${datum}:`, JSON.stringify(res).substring(0, 150));
   return (res.items || []).map(e => ({
     titel:   e.summary || '(kein Titel)',
     start:   e.start?.dateTime ? e.start.dateTime.substring(11, 16) : '',
@@ -154,17 +156,11 @@ async function getWetterWoche() {
     '&daily=temperature_2m_max,temperature_2m_min,weathercode',
     '&timezone=Europe%2FBerlin&forecast_days=8'
   ].join(''));
-  const codes = {
-    0:'☀️', 1:'🌤️', 2:'⛅', 3:'☁️', 45:'🌫️', 51:'🌦️', 61:'🌧️', 71:'❄️', 80:'🌦️', 95:'⛈️'
-  };
+  const codes = { 0:'☀️', 1:'🌤️', 2:'⛅', 3:'☁️', 45:'🌫️', 51:'🌦️', 61:'🌧️', 71:'❄️', 80:'🌦️', 95:'⛈️' };
   const tage = {};
   const daily = res.daily;
   for (let i = 0; i < (daily?.time?.length ?? 0); i++) {
-    tage[daily.time[i]] = {
-      emoji: codes[daily.weathercode[i]] ?? '🌡️',
-      max: Math.round(daily.temperature_2m_max[i]),
-      min: Math.round(daily.temperature_2m_min[i])
-    };
+    tage[daily.time[i]] = { emoji: codes[daily.weathercode[i]] ?? '🌡️', max: Math.round(daily.temperature_2m_max[i]), min: Math.round(daily.temperature_2m_min[i]) };
   }
   return tage;
 }
@@ -179,9 +175,7 @@ async function sendTelegram(text) {
   }
   chunks.push(text);
   for (const chunk of chunks) {
-    const res = await post('api.telegram.org', `/bot${TELEGRAM_TOKEN}/sendMessage`, {
-      chat_id: TELEGRAM_CHAT_ID, text: chunk, parse_mode: 'HTML'
-    });
+    const res = await post('api.telegram.org', `/bot${TELEGRAM_TOKEN}/sendMessage`, { chat_id: TELEGRAM_CHAT_ID, text: chunk, parse_mode: 'HTML' });
     if (!res.ok) throw new Error('Telegram: ' + JSON.stringify(res));
   }
 }
@@ -190,31 +184,38 @@ async function main() {
   const istNaechsteWoche = WOCHE_INPUT === 'naechste';
   const { montag, freitag } = wochenbereich(istNaechsteWoche ? 1 : 0);
 
-  const accessToken = await getAccessToken().catch(() => null);
+  let accessToken = null;
+  try {
+    accessToken = await getAccessToken();
+    console.log('✅ Access Token erhalten');
+  } catch(e) {
+    console.error('❌ Access Token Fehler:', e.message);
+  }
 
   const [stundenplan, todos, personal, wetterMap] = await Promise.all([
-    getWochenplan(montag, freitag).catch(() => ({})),
-    getTodos().catch(() => []),
-    getPersonalTodos().catch(() => []),
-    getWetterWoche().catch(() => ({}))
+    getWochenplan(montag, freitag).catch(e => { console.error('Stundenplan-Fehler:', e.message); return {}; }),
+    getTodos().catch(e => { console.error('Todo-Fehler:', e.message); return []; }),
+    getPersonalTodos().catch(e => { console.error('Personal-Fehler:', e.message); return []; }),
+    getWetterWoche().catch(e => { console.error('Wetter-Fehler:', e.message); return {}; })
   ]);
 
-  // Kalendertermine für alle 5 Tage
   const termineProTag = {};
   if (accessToken) {
-    await Promise.all(
-      Array.from({ length: 5 }, (_, i) => addTage(montag, i)).map(async datum => {
-        termineProTag[datum] = await getKalenderTermine(datum, accessToken).catch(() => []);
-      })
-    );
+    for (let i = 0; i < 5; i++) {
+      const datum = addTage(montag, i);
+      try {
+        termineProTag[datum] = await getKalenderTermine(datum, accessToken);
+      } catch(e) {
+        console.error(`Kalender-Fehler ${datum}:`, e.message);
+        termineProTag[datum] = [];
+      }
+    }
   }
 
   const wochenLabel = istNaechsteWoche ? 'nächste Woche' : 'diese Woche';
-  let msg = `📅 <b>Wochenausblick – ${wochenLabel}</b>\n`;
-  msg += `<b>${formatKurzdatum(montag)} – ${formatKurzdatum(freitag)}</b>\n\n`;
+  let msg = `📅 <b>Wochenausblick – ${wochenLabel}</b>\n<b>${formatKurzdatum(montag)} – ${formatKurzdatum(freitag)}</b>\n\n`;
 
   const wochentage = ['Montag','Dienstag','Mittwoch','Donnerstag','Freitag'];
-
   for (let i = 0; i < 5; i++) {
     const datum   = addTage(montag, i);
     const stunden = stundenplan[datum] || [];
@@ -246,7 +247,6 @@ async function main() {
         else msg += `🗓 <b>${t.start}–${t.ende}</b> ${t.titel}\n`;
       }
     }
-
     msg += '\n';
   }
 
@@ -257,10 +257,7 @@ async function main() {
     const pEmoji = { 'Hoch': '🔴', 'Mittel': '🟡', 'Niedrig': '🟢' };
     for (const t of todos.slice(0, 15)) {
       msg += `${pEmoji[t.prioritaet] || '•'} ${t.title}`;
-      if (t.faellig) {
-        const d = new Date(t.faellig + 'T12:00:00');
-        msg += ` <i>(${d.getDate()}.${d.getMonth()+1}.)</i>`;
-      }
+      if (t.faellig) { const d = new Date(t.faellig + 'T12:00:00'); msg += ` <i>(${d.getDate()}.${d.getMonth()+1}.)</i>`; }
       msg += '\n';
     }
     if (todos.length > 15) msg += `… und ${todos.length - 15} weitere\n`;
