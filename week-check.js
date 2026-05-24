@@ -8,14 +8,14 @@ const TELEGRAM_TOKEN     = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
 const WOCHE_INPUT        = process.env.WOCHE_INPUT || 'diese';
 
+const IGNORIEREN = ['AG Bienen', 'Vertiefung'];
+
 function request(options) {
   return new Promise((resolve, reject) => {
     const req = https.request(options, res => {
       let data = '';
       res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); } catch { resolve(data); }
-      });
+      res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve(data); } });
     });
     req.on('error', reject);
     if (options._body) req.write(options._body);
@@ -23,26 +23,22 @@ function request(options) {
   });
 }
 
-function post(hostname, path, body, extraHeaders = {}) {
-  const raw = JSON.stringify(body);
+function post(hostname, path, body, extraHeaders = {}, rawBody = null, contentType = 'application/json') {
+  const raw = rawBody ?? JSON.stringify(body);
   return request({
     hostname, path, method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(raw),
-      ...extraHeaders
-    },
+    headers: { 'Content-Type': contentType, 'Content-Length': Buffer.byteLength(raw), ...extraHeaders },
     _body: raw
   });
 }
 
-function get(hostname, path) {
-  return request({ hostname, path, method: 'GET' });
+function get(hostname, path, extraHeaders = {}) {
+  return request({ hostname, path, method: 'GET', headers: { ...extraHeaders } });
 }
 
 function wochenbereich(offset = 0) {
   const heute = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Berlin' }));
-  const tag   = heute.getDay();
+  const tag = heute.getDay();
   const diffZuMontag = tag === 0 ? -6 : 1 - tag;
   const montag = new Date(heute);
   montag.setDate(heute.getDate() + diffZuMontag + offset * 7);
@@ -50,7 +46,7 @@ function wochenbereich(offset = 0) {
   const freitag = new Date(montag);
   freitag.setDate(montag.getDate() + 4);
   const fmt = d => d.toLocaleDateString('fr-CA');
-  return { montag: fmt(montag), freitag: fmt(freitag), montagDate: montag };
+  return { montag: fmt(montag), freitag: fmt(freitag) };
 }
 
 function formatKurzdatum(dateStr) {
@@ -67,8 +63,7 @@ function addTage(dateStr, n) {
 async function notionQuery(dbId, filter) {
   const payload = filter ? { filter, page_size: 100 } : { page_size: 100 };
   const res = await post('api.notion.com', `/v1/databases/${dbId}/query`, payload, {
-    'Authorization': `Bearer ${NOTION_TOKEN}`,
-    'Notion-Version': '2022-06-28'
+    'Authorization': `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28'
   });
   if (res.object === 'error') throw new Error(res.message);
   return res.results || [];
@@ -86,27 +81,23 @@ async function getWochenplan(montag, freitag) {
     const p = page.properties;
     const datum = p.Datum?.date?.start?.split('T')[0];
     if (!datum) continue;
+    const fach = p.Fach?.title?.[0]?.plain_text || '?';
+    if (IGNORIEREN.includes(fach)) continue;
     if (!tage[datum]) tage[datum] = [];
     tage[datum].push({
-      fach:   p.Fach?.title?.[0]?.plain_text || '?',
-      start:  p.Startzeit?.rich_text?.[0]?.plain_text || '',
-      ende:   p.Endzeit?.rich_text?.[0]?.plain_text || '',
-      raum:   p.Raum?.rich_text?.[0]?.plain_text || '',
+      fach, start: p.Startzeit?.rich_text?.[0]?.plain_text || '',
+      ende: p.Endzeit?.rich_text?.[0]?.plain_text || '',
+      raum: p.Raum?.rich_text?.[0]?.plain_text || '',
       status: p.Status?.select?.name || 'Normal'
     });
   }
-  for (const datum of Object.keys(tage)) {
-    tage[datum].sort((a, b) => a.start.localeCompare(b.start));
-  }
+  for (const datum of Object.keys(tage)) tage[datum].sort((a, b) => a.start.localeCompare(b.start));
   return tage;
 }
 
 async function getTodos() {
   if (!NOTION_TODO_DB) return [];
-  const rows = await notionQuery(NOTION_TODO_DB, {
-    property: 'Status',
-    select: { does_not_equal: 'Erledigt' }
-  });
+  const rows = await notionQuery(NOTION_TODO_DB, { property: 'Status', select: { does_not_equal: 'Erledigt' } });
   const prioritaetOrder = { 'Hoch': 0, 'Mittel': 1, 'Niedrig': 2, '': 3 };
   return rows
     .map(page => {
@@ -126,44 +117,56 @@ async function getTodos() {
     });
 }
 
+async function getPersonalTodos() {
+  const dbId = process.env.NOTION_PERSONAL_DB_ID;
+  if (!dbId) return [];
+  const rows = await notionQuery(dbId, { property: 'Erledigt', checkbox: { equals: false } });
+  return rows.map(page => page.properties['Aufgabe']?.title?.[0]?.plain_text || '').filter(t => t.length > 0);
+}
+
+async function getAccessToken() {
+  const res = await post('oauth2.googleapis.com', '/token', null, {}, new URLSearchParams({
+    client_id:     process.env.GOOGLE_CLIENT_ID,
+    client_secret: process.env.GOOGLE_CLIENT_SECRET,
+    refresh_token: process.env.GOOGLE_REFRESH_TOKEN,
+    grant_type:    'refresh_token'
+  }).toString(), 'application/x-www-form-urlencoded');
+  return res.access_token;
+}
+
+async function getKalenderTermine(datum, accessToken) {
+  const calId = encodeURIComponent(process.env.GOOGLE_CALENDAR_ID || 'primary');
+  const start = encodeURIComponent(datum + 'T00:00:00+02:00');
+  const end   = encodeURIComponent(datum + 'T23:59:59+02:00');
+  const path  = `/calendar/v3/calendars/${calId}/events?timeMin=${start}&timeMax=${end}&singleEvents=true&orderBy=startTime`;
+  const res = await get('www.googleapis.com', path, { 'Authorization': `Bearer ${accessToken}` });
+  return (res.items || []).map(e => ({
+    titel:   e.summary || '(kein Titel)',
+    start:   e.start?.dateTime ? e.start.dateTime.substring(11, 16) : '',
+    ende:    e.end?.dateTime   ? e.end.dateTime.substring(11, 16)   : '',
+    ganztag: !!e.start?.date && !e.start?.dateTime
+  }));
+}
+
 async function getWetterWoche() {
   const res = await get('api.open-meteo.com', [
-    '/v1/forecast',
-    '?latitude=51.5136&longitude=7.4653',
-    '&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,weathercode',
+    '/v1/forecast?latitude=51.5136&longitude=7.4653',
+    '&daily=temperature_2m_max,temperature_2m_min,weathercode',
     '&timezone=Europe%2FBerlin&forecast_days=8'
   ].join(''));
   const codes = {
-    0:'☀️', 1:'🌤️', 2:'⛅', 3:'☁️',
-    45:'🌫️', 48:'🌫️',
-    51:'🌦️', 53:'🌦️', 55:'🌧️',
-    61:'🌧️', 63:'🌧️', 65:'🌧️',
-    71:'❄️', 73:'❄️', 75:'❄️',
-    80:'🌦️', 81:'🌧️', 82:'⛈️',
-    95:'⛈️', 96:'⛈️', 99:'⛈️'
+    0:'☀️', 1:'🌤️', 2:'⛅', 3:'☁️', 45:'🌫️', 51:'🌦️', 61:'🌧️', 71:'❄️', 80:'🌦️', 95:'⛈️'
   };
   const tage = {};
   const daily = res.daily;
   for (let i = 0; i < (daily?.time?.length ?? 0); i++) {
     tage[daily.time[i]] = {
       emoji: codes[daily.weathercode[i]] ?? '🌡️',
-      max:   Math.round(daily.temperature_2m_max[i]),
-      min:   Math.round(daily.temperature_2m_min[i]),
+      max: Math.round(daily.temperature_2m_max[i]),
+      min: Math.round(daily.temperature_2m_min[i])
     };
   }
   return tage;
-}
-
-async function getPersonalTodos() {
-  const dbId = process.env.NOTION_PERSONAL_DB_ID;
-  if (!dbId) return [];
-  const rows = await notionQuery(dbId, {
-    property: 'Erledigt',
-    checkbox: { equals: false }
-  });
-  return rows
-    .map(page => page.properties['Aufgabe']?.title?.[0]?.plain_text || '')
-    .filter(t => t.length > 0);
 }
 
 async function sendTelegram(text) {
@@ -177,9 +180,7 @@ async function sendTelegram(text) {
   chunks.push(text);
   for (const chunk of chunks) {
     const res = await post('api.telegram.org', `/bot${TELEGRAM_TOKEN}/sendMessage`, {
-      chat_id: TELEGRAM_CHAT_ID,
-      text: chunk,
-      parse_mode: 'HTML'
+      chat_id: TELEGRAM_CHAT_ID, text: chunk, parse_mode: 'HTML'
     });
     if (!res.ok) throw new Error('Telegram: ' + JSON.stringify(res));
   }
@@ -189,47 +190,67 @@ async function main() {
   const istNaechsteWoche = WOCHE_INPUT === 'naechste';
   const { montag, freitag } = wochenbereich(istNaechsteWoche ? 1 : 0);
 
-  console.log(`📅 Wochenausblick: ${montag} bis ${freitag} (${WOCHE_INPUT} Woche)`);
+  const accessToken = await getAccessToken().catch(() => null);
 
   const [stundenplan, todos, personal, wetterMap] = await Promise.all([
-    getWochenplan(montag, freitag).catch(e => { console.error('Stundenplan-Fehler:', e.message); return {}; }),
-    getTodos().catch(e => { console.error('Todo-Fehler:', e.message); return []; }),
-    getPersonalTodos().catch(e => { console.error('Personal-Fehler:', e.message); return []; }),
-    getWetterWoche().catch(e => { console.error('Wetter-Fehler:', e.message); return {}; })
+    getWochenplan(montag, freitag).catch(() => ({})),
+    getTodos().catch(() => []),
+    getPersonalTodos().catch(() => []),
+    getWetterWoche().catch(() => ({}))
   ]);
+
+  // Kalendertermine für alle 5 Tage
+  const termineProTag = {};
+  if (accessToken) {
+    await Promise.all(
+      Array.from({ length: 5 }, (_, i) => addTage(montag, i)).map(async datum => {
+        termineProTag[datum] = await getKalenderTermine(datum, accessToken).catch(() => []);
+      })
+    );
+  }
 
   const wochenLabel = istNaechsteWoche ? 'nächste Woche' : 'diese Woche';
   let msg = `📅 <b>Wochenausblick – ${wochenLabel}</b>\n`;
   msg += `<b>${formatKurzdatum(montag)} – ${formatKurzdatum(freitag)}</b>\n\n`;
 
   const wochentage = ['Montag','Dienstag','Mittwoch','Donnerstag','Freitag'];
+
   for (let i = 0; i < 5; i++) {
     const datum   = addTage(montag, i);
     const stunden = stundenplan[datum] || [];
     const wetter  = wetterMap[datum];
+    const termine = termineProTag[datum] || [];
     const wetterStr = wetter ? ` ${wetter.emoji} ↑${wetter.max}° ↓${wetter.min}°` : '';
+
     msg += `━━ <b>${wochentage[i]} ${formatKurzdatum(datum)}</b>${wetterStr} ━━\n`;
+
     if (stunden.length === 0) {
       msg += `✨ Kein Unterricht\n`;
     } else {
       for (const s of stunden) {
-        const emoji = s.status === 'Ausfall'    ? '❌'
-                    : s.status === 'Vertretung' ? '🔄'
-                    : s.status === 'Prüfung'    ? '📝'
-                    : '✅';
+        const emoji = s.status === 'Ausfall' ? '❌' : s.status === 'Vertretung' ? '🔄' : s.status === 'Prüfung' ? '📝' : '✅';
         msg += `${emoji} ${s.start}–${s.ende} <b>${s.fach}</b>`;
         if (s.raum) msg += ` · ${s.raum}`;
-        if (s.status === 'Ausfall')    msg += ` <i>(Ausfall)</i>`;
-        if (s.status === 'Vertretung') msg += ` <i>(Vertretung)</i>`;
-        if (s.status === 'Prüfung')    msg += ` <i>(Prüfung!)</i>`;
+        if (s.status === 'Ausfall') msg += ` <i>(Ausfall)</i>`;
+        else if (s.status === 'Vertretung') msg += ` <i>(Vertretung)</i>`;
+        else if (s.status === 'Prüfung') msg += ` <i>(Prüfung!)</i>`;
         msg += '\n';
       }
     }
+
+    if (termine.length === 0) {
+      msg += `📅 Keine Termine\n`;
+    } else {
+      for (const t of termine) {
+        if (t.ganztag) msg += `🗓 ${t.titel} <i>(ganztägig)</i>\n`;
+        else msg += `🗓 <b>${t.start}–${t.ende}</b> ${t.titel}\n`;
+      }
+    }
+
     msg += '\n';
   }
 
-  // Schulaufgaben
-  msg += `✅ <b>Offene Schulaufgaben</b>\n`;
+  msg += `✅ <b>Offene Aufgaben</b>\n`;
   if (todos.length === 0) {
     msg += `🎉 Alles erledigt!\n`;
   } else {
@@ -245,13 +266,9 @@ async function main() {
     if (todos.length > 15) msg += `… und ${todos.length - 15} weitere\n`;
   }
 
-  // Persönliche Aufgaben – immer anzeigen
   msg += `\n🏠 <b>Persönliche Aufgaben</b>\n`;
-  if (personal.length === 0) {
-    msg += `🎉 Nichts zu erledigen!\n`;
-  } else {
-    for (const t of personal) msg += `☐ ${t}\n`;
-  }
+  if (personal.length === 0) msg += `🎉 Nichts zu erledigen!\n`;
+  else for (const t of personal) msg += `☐ ${t}\n`;
 
   msg += `\n🚀 <i>Viel Erfolg ${wochenLabel}!</i>`;
 
@@ -259,7 +276,4 @@ async function main() {
   console.log('✅ Wochenausblick gesendet!');
 }
 
-main().catch(err => {
-  console.error('Fehler:', err);
-  process.exit(1);
-});
+main().catch(err => { console.error('Fehler:', err); process.exit(1); });
