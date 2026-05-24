@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "dependencies": {
     "@notionhq/client": "^2.2.15",
-    "playwright": "^1.44.0"
+    "playwright": "^1.44.0",
+    "google-auth-library": "^9.0.0"
   }
 }
