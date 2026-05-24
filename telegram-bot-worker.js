@@ -92,7 +92,7 @@ async function handleNachricht(env, chatId, text) {
           'Content-Type': 'application/json',
           'User-Agent': 'schul-bot'
         },
-        body: JSON.stringify({ ref: 'main', inputs: { woche: 'nächste' } })
+        body: JSON.stringify({ ref: 'main', inputs: { woche: 'naechste' } })
       }
     );
     if (res.status === 204) {
