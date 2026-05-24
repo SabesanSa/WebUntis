@@ -7,6 +7,8 @@ const ISERV_USER = process.env.ISERV_USER;
 const ISERV_PASS = process.env.ISERV_PASS;
 
 function parseTime(t) {
+  // Supports both integer (830) and string ("08:30") formats
+  if (typeof t === "string" && t.includes(":")) return t.slice(0, 5);
   const h = Math.floor(t / 100), m = t % 100;
   return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}`;
 }
@@ -14,9 +16,13 @@ function parseDateInt(d) {
   const s = String(d);
   return `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}`;
 }
+function parseISODate(s) {
+  // Handle "2026-05-27T08:10:00" or "2026-05-27"
+  return s.slice(0, 10);
+}
 function getStatus(p) {
-  if (p.cellState === "CANCEL" || p.type === 2) return "Ausfall";
-  if (p.cellState === "SUBSTITUTION" || p.type === 3) return "Vertretung";
+  if (p.cellState === "CANCEL" || p.type === 2 || p.isCancelled) return "Ausfall";
+  if (p.cellState === "SUBSTITUTION" || p.type === 3 || p.isSubstitution) return "Vertretung";
   return "Normal";
 }
 function getMondayOfWeek(offset = 0) {
@@ -30,10 +36,12 @@ function getMondayOfWeek(offset = 0) {
 }
 function toISODate(d) { return d.toISOString().split("T")[0]; }
 
-function extractLessons(json) {
+function extractLessons(json, sourcePath) {
   const lessons = [];
+  
+  // Format 1: classic days/periods
   const data = json?.data ?? json;
-  const days = data?.days ?? data?.weeks?.[0]?.days ?? (Array.isArray(data) ? data : []);
+  const days = data?.days ?? data?.weeks?.[0]?.days ?? [];
   for (const day of days) {
     if (!day?.date) continue;
     const dateISO = parseDateInt(day.date);
@@ -50,6 +58,32 @@ function extractLessons(json) {
       });
     }
   }
+  if (lessons.length > 0) return lessons;
+
+  // Format 2: entries array (new WebUntis format)
+  const entries = data?.entries ?? data?.timetableEntries ?? data?.periods ?? 
+                  (Array.isArray(data) ? data : null);
+  if (entries) {
+    for (const e of entries) {
+      const start = e.start ?? e.startTime ?? e.startDateTime ?? e.from;
+      const end = e.end ?? e.endTime ?? e.endDateTime ?? e.to;
+      const date = e.date ?? e.day;
+      if (!start) continue;
+
+      const dateISO = date ? (String(date).length === 8 ? parseDateInt(date) : parseISODate(String(date)))
+                           : parseISODate(String(start));
+      const startTime = typeof start === "number" ? parseTime(start) : parseISODate(String(start)) !== dateISO ? start.slice(11,16) : parseTime(start);
+      const endTime = typeof end === "number" ? parseTime(end) : end?.slice(11,16) ?? "";
+
+      const subject = e.subject?.longName ?? e.subject?.name ?? e.subjectName ?? 
+                      e.subjects?.[0]?.longName ?? e.subjects?.[0]?.name ?? "Unbekannt";
+      const room = e.room?.name ?? e.roomName ?? e.rooms?.[0]?.name ?? "";
+      const teacher = e.teacher?.name ?? e.teacherName ?? e.teachers?.[0]?.name ?? "";
+
+      lessons.push({ date: dateISO, subject, startTime, endTime, room, teacher, status: getStatus(e) });
+    }
+  }
+
   return lessons;
 }
 
@@ -68,19 +102,21 @@ async function fetchTimetable() {
   const page = await context.newPage();
   const capturedLessons = [];
 
-  // Alle JSON-Responses loggen
   page.on("response", async (response) => {
     const url = response.url();
     if (!url.includes("webuntis.com")) return;
     const ct = response.headers()["content-type"] ?? "";
     if (!ct.includes("json")) return;
+    const path = url.replace(/https?:\/\/[^/]+/, "").split("?")[0];
     try {
       const body = await response.text();
-      const path = url.replace(/https?:\/\/[^/]+/, "").split("?")[0];
-      console.log(`📥 ${response.status()} ${path}`);
-      if (body.length < 500) console.log(`   ${body}`);
+      // Log entries endpoint vollständig
+      if (path.includes("timetable/entries")) {
+        console.log(`📥 ${response.status()} ${path}`);
+        console.log(`   FULL BODY: ${body.slice(0, 2000)}`);
+      }
       const json = JSON.parse(body);
-      const lessons = extractLessons(json);
+      const lessons = extractLessons(json, path);
       if (lessons.length > 0) {
         console.log(`🎯 ${lessons.length} Stunden aus ${path}!`);
         capturedLessons.push(...lessons);
@@ -89,7 +125,6 @@ async function fetchTimetable() {
   });
 
   try {
-    // 1. Login über alte WebUntis-URL (IServ SSO funktioniert hier)
     console.log("🌐 Öffne WebUntis Login...");
     await page.goto("https://wkdo.webuntis.com/WebUntis/?school=wkdo", {
       waitUntil: "domcontentloaded", timeout: 20000
@@ -122,13 +157,11 @@ async function fetchTimetable() {
 
     console.log("✅ Eingeloggt:", page.url());
 
-    // 2. Neue Timetable-URL aufrufen (echte URL aus dem Browser)
     for (const offset of [0, 1]) {
       const dateStr = toISODate(getMondayOfWeek(offset));
-      const timetableUrl = `https://wkdo.webuntis.com/timetable/my-student?date=${dateStr}`;
-      
-      console.log(`\n📅 Lade ${timetableUrl}`);
-      await page.goto(timetableUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
+      const url = `https://wkdo.webuntis.com/timetable/my-student?date=${dateStr}`;
+      console.log(`\n📅 Lade ${url}`);
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
       await page.waitForTimeout(8000);
       console.log(`   ${capturedLessons.length} Stunden bisher`);
     }
