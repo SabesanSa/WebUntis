@@ -1,5 +1,6 @@
 // week-check.js – Wochenausblick via Telegram
-const https = require('https');
+const https   = require('https');
+const { GoogleAuth, OAuth2Client } = require('google-auth-library');
 
 const NOTION_TOKEN       = process.env.NOTION_TOKEN;
 const NOTION_STUNDENPLAN = process.env.NOTION_DATABASE_ID;
@@ -23,11 +24,11 @@ function request(options) {
   });
 }
 
-function post(hostname, path, body, extraHeaders = {}, rawBody = null, contentType = 'application/json') {
-  const raw = rawBody ?? JSON.stringify(body);
+function post(hostname, path, body, extraHeaders = {}) {
+  const raw = JSON.stringify(body);
   return request({
     hostname, path, method: 'POST',
-    headers: { 'Content-Type': contentType, 'Content-Length': Buffer.byteLength(raw), ...extraHeaders },
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(raw), ...extraHeaders },
     _body: raw
   });
 }
@@ -121,39 +122,14 @@ async function getPersonalTodos() {
 }
 
 async function getAccessToken() {
-  const clientId     = (process.env.GOOGLE_CLIENT_ID     || '').trim();
-  const clientSecret = (process.env.GOOGLE_CLIENT_SECRET || '').trim();
-  const refreshToken = (process.env.GOOGLE_REFRESH_TOKEN || '').trim();
-
-  console.log('🔑 Refresh Token Ende:', refreshToken.slice(-10));
-
-  const body = `client_id=${encodeURIComponent(clientId)}&client_secret=${encodeURIComponent(clientSecret)}&refresh_token=${encodeURIComponent(refreshToken)}&grant_type=refresh_token`;
-
-  return new Promise((resolve, reject) => {
-    const req = https.request({
-      hostname: 'oauth2.googleapis.com',
-      path: '/token',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Content-Length': Buffer.byteLength(body)
-      }
-    }, res => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try {
-          const parsed = JSON.parse(data);
-          console.log('🔑 Token Antwort:', JSON.stringify(parsed).substring(0, 120));
-          if (!parsed.access_token) reject(new Error('Kein access_token: ' + data));
-          else resolve(parsed.access_token);
-        } catch(e) { reject(e); }
-      });
-    });
-    req.on('error', reject);
-    req.write(body);
-    req.end();
-  });
+  const oauth2Client = new OAuth2Client(
+    process.env.GOOGLE_CLIENT_ID.trim(),
+    process.env.GOOGLE_CLIENT_SECRET.trim()
+  );
+  oauth2Client.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN.trim() });
+  const { token } = await oauth2Client.getAccessToken();
+  console.log('✅ Access Token erhalten:', token ? 'ja' : 'nein');
+  return token;
 }
 
 async function getKalenderTermine(datum, accessToken) {
@@ -161,9 +137,8 @@ async function getKalenderTermine(datum, accessToken) {
   const start = encodeURIComponent(datum + 'T00:00:00+02:00');
   const end   = encodeURIComponent(datum + 'T23:59:59+02:00');
   const path  = `/calendar/v3/calendars/${calId}/events?timeMin=${start}&timeMax=${end}&singleEvents=true&orderBy=startTime`;
-
   const res = await get('www.googleapis.com', path, { 'Authorization': `Bearer ${accessToken}` });
-  console.log(`📅 Kalender ${datum}:`, JSON.stringify(res).substring(0, 150));
+  if (res.error) { console.error('Kalender Fehler:', JSON.stringify(res.error)); return []; }
   return (res.items || []).map(e => ({
     titel:   e.summary || '(kein Titel)',
     start:   e.start?.dateTime ? e.start.dateTime.substring(11, 16) : '',
@@ -209,7 +184,6 @@ async function main() {
   let accessToken = null;
   try {
     accessToken = await getAccessToken();
-    console.log('✅ Access Token erhalten');
   } catch(e) {
     console.error('❌ Access Token Fehler:', e.message);
   }
@@ -225,12 +199,7 @@ async function main() {
   if (accessToken) {
     for (let i = 0; i < 5; i++) {
       const datum = addTage(montag, i);
-      try {
-        termineProTag[datum] = await getKalenderTermine(datum, accessToken);
-      } catch(e) {
-        console.error(`Kalender-Fehler ${datum}:`, e.message);
-        termineProTag[datum] = [];
-      }
+      termineProTag[datum] = await getKalenderTermine(datum, accessToken).catch(() => []);
     }
   }
 
