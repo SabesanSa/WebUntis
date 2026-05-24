@@ -23,7 +23,9 @@ function extractLessons(json) {
 
   for (const day of json?.days ?? []) {
     const date = day.date;
-    const wochentag = WOCHENTAGE[new Date(date + "T00:00:00").getDay()];
+    const dayOfWeek = new Date(date + "T00:00:00").getDay();
+    if (dayOfWeek === 6) continue; // Samstag überspringen
+    const wochentag = WOCHENTAGE[dayOfWeek];
 
     // Reguläre Stunden aus gridEntries
     for (const entry of day.gridEntries ?? []) {
@@ -114,8 +116,13 @@ async function fetchTimetable() {
     for (const offset of [0, 1, 2]) {
       const dateStr = toISODate(getMondayOfWeek(offset));
       console.log("Woche: " + dateStr);
+      const responsePromise = page.waitForResponse(
+        r => r.url().includes("timetable/entries") && !r.url().includes("settings"),
+        { timeout: 15000 }
+      ).catch(() => null);
       await page.goto("https://wkdo.webuntis.com/timetable/my-student?date=" + dateStr, { waitUntil: "domcontentloaded", timeout: 20000 });
-      await page.waitForTimeout(8000);
+      await responsePromise;
+      await page.waitForTimeout(1000);
       console.log("Bisher: " + capturedLessons.length);
     }
     return capturedLessons;
