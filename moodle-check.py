@@ -153,6 +153,19 @@ def lade_datei(s, url):
 # ── Hauptprogramm ─────────────────────────────────────────────────────────────
 
 def main():
+    print("🚀 Script gestartet", flush=True)
+    # Erreichbarkeit testen
+    try:
+        r = requests.get(MOODLE_URL, timeout=10)
+        print(f"🌐 Moodle erreichbar: Status {r.status_code}", flush=True)
+    except requests.exceptions.ConnectTimeout:
+        telegram("❌ Moodle nicht erreichbar – Verbindung läuft auf Timeout (Firewall?)")
+        print("❌ Timeout – Server nicht erreichbar von GitHub Actions", flush=True)
+        return
+    except Exception as e:
+        telegram(f"❌ Verbindungsfehler: {e}")
+        print(f"❌ Fehler: {e}", flush=True)
+        return
     if not ROOT_FOLDER:
         telegram("❌ DRIVE_ROOT_FOLDER_ID fehlt in GitHub Secrets.")
         return
