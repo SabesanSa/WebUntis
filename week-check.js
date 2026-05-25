@@ -1,6 +1,6 @@
 // week-check.js – Wochenausblick via Telegram
 const https   = require('https');
-const { GoogleAuth, OAuth2Client } = require('google-auth-library');
+const { JWT } = require('google-auth-library');
 
 const NOTION_TOKEN       = process.env.NOTION_TOKEN;
 const NOTION_STUNDENPLAN = process.env.NOTION_DATABASE_ID;
@@ -122,18 +122,19 @@ async function getPersonalTodos() {
 }
 
 async function getAccessToken() {
-  const oauth2Client = new OAuth2Client(
-    process.env.GOOGLE_CLIENT_ID.trim(),
-    process.env.GOOGLE_CLIENT_SECRET.trim()
-  );
-  oauth2Client.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN.trim() });
-  const { token } = await oauth2Client.getAccessToken();
-  console.log('✅ Access Token erhalten:', token ? 'ja' : 'nein');
-  return token;
+  const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+  const jwt = new JWT({
+    email: serviceAccount.client_email,
+    key: serviceAccount.private_key,
+    scopes: ['https://www.googleapis.com/auth/calendar.readonly']
+  });
+  const token = await jwt.authorize();
+  console.log('✅ Service Account Token erhalten');
+  return token.access_token;
 }
 
 async function getKalenderTermine(datum, accessToken) {
-  const calId = encodeURIComponent(process.env.GOOGLE_CALENDAR_ID || 'primary');
+  const calId = encodeURIComponent('sabesis@web.de');
   const start = encodeURIComponent(datum + 'T00:00:00+02:00');
   const end   = encodeURIComponent(datum + 'T23:59:59+02:00');
   const path  = `/calendar/v3/calendars/${calId}/events?timeMin=${start}&timeMax=${end}&singleEvents=true&orderBy=startTime`;
@@ -185,7 +186,7 @@ async function main() {
   try {
     accessToken = await getAccessToken();
   } catch(e) {
-    console.error('❌ Access Token Fehler:', e.message);
+    console.error('❌ Token Fehler:', e.message);
   }
 
   const [stundenplan, todos, personal, wetterMap] = await Promise.all([
@@ -199,7 +200,11 @@ async function main() {
   if (accessToken) {
     for (let i = 0; i < 5; i++) {
       const datum = addTage(montag, i);
-      termineProTag[datum] = await getKalenderTermine(datum, accessToken).catch(() => []);
+      termineProTag[datum] = await getKalenderTermine(datum, accessToken).catch(e => {
+        console.error(`Kalender-Fehler ${datum}:`, e.message);
+        return [];
+      });
+      console.log(`📅 ${datum}: ${termineProTag[datum].length} Termine`);
     }
   }
 
