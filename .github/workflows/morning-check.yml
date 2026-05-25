@@ -1,0 +1,31 @@
+name: 🌅 Schul-Check
+
+on:
+  schedule:
+    - cron: "0 4 * * 1-5"
+    - cron: "0 5 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  schul-check:
+    name: Schul-Check senden
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: npm install
+      - name: 🌅 Schul-Check ausführen
+        env:
+          NOTION_TOKEN:                  ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID:            ${{ secrets.NOTION_DATABASE_ID }}
+          NOTION_TODO_DATABASE_ID:       ${{ secrets.NOTION_TODO_DATABASE_ID }}
+          TELEGRAM_BOT_TOKEN:            ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:              ${{ secrets.TELEGRAM_CHAT_ID }}
+          NOTION_PERSONAL_DB_ID:         ${{ secrets.NOTION_PERSONAL_DB_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON:   ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GITHUB_EVENT_NAME:             ${{ github.event_name }}
+        run: node morning-check.js
