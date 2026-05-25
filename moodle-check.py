@@ -4,11 +4,7 @@ Moodle-Check: Loggt sich per Session-Cookie ein, erkennt neue Dateien,
 lädt sie herunter und speichert sie in Google Drive unter Schule/<Fach>/
 """
 
-import os
-import re
-import json
-import hashlib
-import io
+import os, re, json, hashlib, io, sys
 import requests
 from bs4 import BeautifulSoup
 from google.oauth2 import service_account
@@ -24,202 +20,119 @@ TG_CHAT_ID  = os.environ["TELEGRAM_CHAT_ID"]
 SA_JSON     = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 ROOT_FOLDER = os.environ.get("DRIVE_ROOT_FOLDER_ID", "")
 KNOWN_FILE  = "moodle_known_files.json"
-
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 
-# ── Kurs-Regeln ───────────────────────────────────────────────────────────────
+# ── Kurs-Mapping (exakte Kursnamen aus Moodle) ────────────────────────────────
+# None  = überspringen
+# str   = Drive-Ordnername
 
-# Kurse die NICHT heruntergeladen werden (Teilstring reicht)
-SKIP_KURSE = [
-    "informatik",
-    "französisch",
-    "franzoesisch",
-    "franz",
-]
+KURS_MAPPING = {
+    # ── Informatik (alle überspringen) ────────────────────────────────────────
+    "Informatik - Allgemeine Informationen":                None,
+    "Material Informatik - dynamische Datenstrukturen":     None,
+    "Material Informatik: Algorithmen - Suchen und Sortieren": None,
+    "Material Informatik GLOOP (3./4. Sem)":               None,
+    "4 KO-IF GK a Kluth 2025/26.2":                        None,
 
-# Kurse die in einen gemeinsamen Ordner zusammengeführt werden
-# Format: "Teilstring im Kursnamen (lowercase)" -> "Ordnername in Drive"
-MERGE_KURSE = {
-    "französisch": "Französisch",
-    "franzoesisch": "Französisch",
-    "franz":        "Französisch",
+    # ── Sonstiges überspringen ─────────────────────────────────────────────────
+    "Cafete":                                               None,
+    "Allgemeine Schulforen des Westfalen-Kollegs":          None,
+
+    # ── Französisch (beide Kurse → ein Ordner) ────────────────────────────────
+    "4 KO-FA GK a Klee 2025/26.2":                         "Französisch",
+    "K_FAGKa-3.13.23.3_KLW":                               "Französisch",
+
+    # ── Physik (nach Lehrer getrennt) ──────────────────────────────────────────
+    "4 PH-GK b Ritzenhofen, J 2025/26.2":                  "Physik (Ritzenhofen)",
+    "4 Ph Ellermann 26":                                    "Physik (Ellermann)",
+
+    # ── Alle anderen Kurse ────────────────────────────────────────────────────
+    "4 EW LK Suerhoff 2025/26":                            "Erziehungswissenschaften",
+    "4 K-PL GKa Philosophie Kelbassa":                     "Philosophie",
+    "4 KO-M GK2 KOS 2025/26.2":                            "Mathematik",
+    "4 KO-D GK 2 Hardt-Bongard, 2027/28.2":               "Deutsch",
+    "4. Sem. - Kunst - Bockholt - 25/26":                  "Kunst",
+    "4.2 E LK Geshengorin 25/26.2":                        "Englisch",
 }
 
-# Kurse bei denen mehrere Instanzen existieren und benannt werden sollen
-# Schlüssel: Teilstring (lowercase), Wert: Präfix für Nummerierung
-MULTI_KURSE = {
-    "physik": "Physik",
-}
-
-# ── Kursname normalisieren ────────────────────────────────────────────────────
-
-# Merkt sich welche Multi-Kurs-Nummer schon vergeben wurde
-_multi_zaehler = {}
-# Merkt sich kurs_id -> Drive-Ordnername
-_kurs_ordner_namen = {}
-
-def ordnername_fuer_kurs(kurs_id: str, kurs_name: str) -> str | None:
-    """
-    Gibt den Drive-Ordnernamen zurück, oder None wenn der Kurs übersprungen wird.
-    Behandelt Merges (Französisch) und Nummerierung (Physik I, II).
-    """
-    name_lower = kurs_name.lower()
-
-    # Bereits verarbeitet?
-    if kurs_id in _kurs_ordner_namen:
-        return _kurs_ordner_namen[kurs_id]
-
-    # Überspringen?
-    for skip in SKIP_KURSE:
-        if skip in name_lower:
-            _kurs_ordner_namen[kurs_id] = None
-            return None
-
-    # Merge-Kurse (z.B. Französisch I + II → ein Ordner)
-    for muster, zielname in MERGE_KURSE.items():
-        if muster in name_lower:
-            _kurs_ordner_namen[kurs_id] = zielname
-            return zielname
-
-    # Multi-Kurse mit Nummerierung (z.B. Physik I, Physik II)
-    for muster, praefix in MULTI_KURSE.items():
-        if muster in name_lower:
-            # Lehrernamen aus dem Kursnamen extrahieren (oft in Klammern oder nach "-")
-            lehrer = _extrahiere_lehrer(kurs_name)
-            if lehrer:
-                ordner = f"{praefix} ({lehrer})"
-            else:
-                # Sequenziell nummerieren
-                n = _multi_zaehler.get(praefix, 0) + 1
-                _multi_zaehler[praefix] = n
-                roemisch = ["I", "II", "III", "IV", "V"]
-                ordner = f"{praefix} {roemisch[n-1] if n <= 5 else str(n)}"
-            _kurs_ordner_namen[kurs_id] = ordner
-            return ordner
-
-    # Normaler Kurs – Kursnamen aufräumen
-    bereinigt = _bereinige_name(kurs_name)
-    _kurs_ordner_namen[kurs_id] = bereinigt
-    return bereinigt
-
-def _extrahiere_lehrer(kurs_name: str) -> str:
-    """Versucht einen Lehrernamen aus dem Kursnamen zu extrahieren."""
-    # Muster: "Physik - Müller", "Physik (Müller)", "Physik Müller"
-    m = re.search(r'[-–(]\s*([A-ZÄÖÜ][a-zäöüß]+)\s*\)?$', kurs_name)
-    if m:
-        return m.group(1)
-    # Muster: letztes Wort wenn es wie ein Name aussieht
-    teile = kurs_name.split()
-    if len(teile) >= 2:
-        letztes = teile[-1].strip("()")
-        if letztes[0].isupper() and len(letztes) > 2:
-            return letztes
-    return ""
-
-def _bereinige_name(name: str) -> str:
-    """Entfernt überflüssige Zusätze aus Kursnamen."""
-    # Typische Moodle-Zusätze entfernen
-    name = re.sub(r'\s*[-–]\s*(20\d\d|WS|SS|Kurs\s*\d+)\s*$', '', name, flags=re.IGNORECASE)
-    return name.strip()
+def ordnername(kurs_name: str):
+    """Gibt Drive-Ordnernamen zurück, None = überspringen, '?' = unbekannter Kurs."""
+    if kurs_name in KURS_MAPPING:
+        return KURS_MAPPING[kurs_name]
+    # Unbekannte Kurse: trotzdem herunterladen, Ordnername = Kursname bereinigt
+    return kurs_name.strip()
 
 # ── Google Drive ──────────────────────────────────────────────────────────────
 
 def drive_service():
-    info = json.loads(SA_JSON)
-    creds = service_account.Credentials.from_service_account_info(info, scopes=DRIVE_SCOPES)
+    creds = service_account.Credentials.from_service_account_info(
+        json.loads(SA_JSON), scopes=DRIVE_SCOPES)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 def finde_oder_erstelle_ordner(drive, name, parent_id):
-    name_escaped = name.replace("'", "\\'")
-    q = (f"name='{name_escaped}' and mimeType='application/vnd.google-apps.folder' "
+    safe = name.replace("'", "\\'")
+    q = (f"name='{safe}' and mimeType='application/vnd.google-apps.folder' "
          f"and '{parent_id}' in parents and trashed=false")
-    result = drive.files().list(q=q, fields="files(id)").execute()
-    treffer = result.get("files", [])
+    treffer = drive.files().list(q=q, fields="files(id)").execute().get("files", [])
     if treffer:
         return treffer[0]["id"]
     meta = {"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}
     return drive.files().create(body=meta, fields="id").execute()["id"]
 
-def lade_hoch(drive, inhalt: bytes, dateiname: str, mime: str, ordner_id: str):
-    meta = {"name": dateiname, "parents": [ordner_id]}
+def lade_hoch(drive, inhalt, dateiname, mime, ordner_id):
+    meta  = {"name": dateiname, "parents": [ordner_id]}
     media = MediaIoBaseUpload(io.BytesIO(inhalt), mimetype=mime, resumable=False)
     drive.files().create(body=meta, media_body=media, fields="id").execute()
 
-# ── Hilfsfunktionen ───────────────────────────────────────────────────────────
+# ── Telegram ──────────────────────────────────────────────────────────────────
 
-def lade_bekannte():
-    if os.path.exists(KNOWN_FILE):
-        with open(KNOWN_FILE) as f:
-            return json.load(f)
-    return {}
-
-def speichere_bekannte(daten):
-    with open(KNOWN_FILE, "w") as f:
-        json.dump(daten, f, indent=2)
-
-def sende_telegram(text):
+def telegram(text):
     requests.post(
         f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
         json={"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
     )
 
-# ── Moodle Login ──────────────────────────────────────────────────────────────
+# ── Moodle ────────────────────────────────────────────────────────────────────
 
 def login():
     s = requests.Session()
     s.headers["User-Agent"] = "Mozilla/5.0"
     page = s.get(f"{MOODLE_URL}/login/index.php")
     soup = BeautifulSoup(page.text, "html.parser")
-    inp = soup.find("input", {"name": "logintoken"})
-    logintoken = inp["value"] if inp else ""
+    inp  = soup.find("input", {"name": "logintoken"})
     resp = s.post(f"{MOODLE_URL}/login/index.php", data={
         "username": USERNAME, "password": PASSWORD,
-        "logintoken": logintoken, "anchor": ""
+        "logintoken": inp["value"] if inp else "", "anchor": ""
     }, allow_redirects=True)
     if "loginerrormessage" in resp.text or resp.url.endswith("login/index.php"):
         raise Exception("Login fehlgeschlagen – Zugangsdaten prüfen.")
-    print("✅ Moodle-Login erfolgreich")
+    print("✅ Moodle-Login erfolgreich", flush=True)
     return s
 
-# ── Kurse & Dateien ───────────────────────────────────────────────────────────
-
 def hole_kurse(s):
-    soup = BeautifulSoup(s.get(f"{MOODLE_URL}/my/").text, "html.parser")
+    soup  = BeautifulSoup(s.get(f"{MOODLE_URL}/my/").text, "html.parser")
     kurse = {}
     for a in soup.find_all("a", href=re.compile(r"/course/view\.php\?id=\d+")):
         m = re.search(r"id=(\d+)", a["href"])
         if m:
-            kid = m.group(1)
+            kid  = m.group(1)
             name = a.get_text(strip=True)
             if name and len(name) > 2 and kid not in kurse:
                 kurse[kid] = name
-    print(f"📚 {len(kurse)} Kurse gefunden")
+    print(f"📚 {len(kurse)} Kurse gefunden", flush=True)
     return kurse
 
 def hole_dateien(s, kurs_id):
-    soup = BeautifulSoup(s.get(f"{MOODLE_URL}/course/view.php?id={kurs_id}").text, "html.parser")
-    dateien = []
-    seen = set()
+    soup  = BeautifulSoup(s.get(f"{MOODLE_URL}/course/view.php?id={kurs_id}").text, "html.parser")
+    seen, dateien = set(), []
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if not any(x in href for x in ["/mod/resource/view.php", "/pluginfile.php"]):
             continue
-        if href in seen:
-            continue
+        if href in seen: continue
         seen.add(href)
-        name = a.get_text(strip=True) or href.split("/")[-1]
-        dateien.append({"name": name, "url": href})
+        dateien.append({"name": a.get_text(strip=True) or href.split("/")[-1], "url": href})
     return dateien
-
-def lade_datei(s, url):
-    resp = s.get(url, timeout=20, allow_redirects=True)
-    mime = resp.headers.get("content-type", "application/octet-stream").split(";")[0]
-    cd = resp.headers.get("content-disposition", "")
-    m = re.search(r'filename[^;=\n]*=["\']?([^"\';\n]+)', cd)
-    echter_name = m.group(1).strip() if m else None
-    return resp.content, mime, echter_name
-
-# ── Hauptprogramm ─────────────────────────────────────────────────────────────
 
 MIME_ENDUNGEN = {
     "application/pdf": ".pdf",
@@ -229,75 +142,78 @@ MIME_ENDUNGEN = {
     "text/plain": ".txt",
 }
 
+def lade_datei(s, url):
+    resp = s.get(url, timeout=20, allow_redirects=True)
+    mime = resp.headers.get("content-type", "application/octet-stream").split(";")[0]
+    cd   = resp.headers.get("content-disposition", "")
+    m    = re.search(r'filename[^;=\n]*=["\']?([^"\';\n]+)', cd)
+    name = m.group(1).strip() if m else None
+    return resp.content, mime, name
+
+# ── Hauptprogramm ─────────────────────────────────────────────────────────────
+
 def main():
     if not ROOT_FOLDER:
-        sende_telegram("❌ Moodle-Check: DRIVE_ROOT_FOLDER_ID fehlt. Bitte in GitHub Secrets eintragen.")
+        telegram("❌ DRIVE_ROOT_FOLDER_ID fehlt in GitHub Secrets.")
         return
 
-    bekannte = lade_bekannte()
-    drive = drive_service()
-    # Ordner-ID-Cache (Drive-Ordnername → ID)
+    bekannte     = json.load(open(KNOWN_FILE)) if os.path.exists(KNOWN_FILE) else {}
+    drive        = drive_service()
     ordner_cache = {}
-    neue_gesamt = 0
+    neue_gesamt  = 0
 
     try:
         s = login()
     except Exception as e:
-        sende_telegram(f"❌ Moodle-Login fehlgeschlagen: {e}")
+        telegram(f"❌ Moodle-Login fehlgeschlagen: {e}")
         return
 
     kurse = hole_kurse(s)
     if not kurse:
-        sende_telegram("⚠️ Moodle: Keine Kurse gefunden.")
+        telegram("⚠️ Moodle: Keine Kurse gefunden.")
         return
 
     for kurs_id, kurs_name in kurse.items():
-        ordner_name = ordnername_fuer_kurs(kurs_id, kurs_name)
-
-        if ordner_name is None:
-            print(f"⏭️  Übersprungen: {kurs_name}")
+        ziel = ordnername(kurs_name)
+        if ziel is None:
+            print(f"⏭️  Übersprungen: {kurs_name}", flush=True)
             continue
 
-        dateien = hole_dateien(s, kurs_id)
+        print(f"🔍 Prüfe: {kurs_name} → {ziel}", flush=True)
+        dateien      = hole_dateien(s, kurs_id)
         neue_im_kurs = []
 
         for datei in dateien:
             key = hashlib.md5(datei["url"].encode()).hexdigest()
             if key in bekannte:
                 continue
-
             try:
                 inhalt, mime, echter_name = lade_datei(s, datei["url"])
             except Exception as e:
-                print(f"⚠️ Download-Fehler {datei['name']}: {e}")
+                print(f"  ⚠️ Download-Fehler {datei['name']}: {e}", flush=True)
                 continue
 
             dateiname = echter_name or datei["name"]
-            hat_endung = any(dateiname.endswith(e) for e in MIME_ENDUNGEN.values())
-            if not hat_endung:
+            if not any(dateiname.endswith(ext) for ext in MIME_ENDUNGEN.values()):
                 dateiname += MIME_ENDUNGEN.get(mime, "")
 
             try:
-                if ordner_name not in ordner_cache:
-                    ordner_cache[ordner_name] = finde_oder_erstelle_ordner(drive, ordner_name, ROOT_FOLDER)
-                lade_hoch(drive, inhalt, dateiname, mime, ordner_cache[ordner_name])
-                bekannte[key] = {"name": dateiname, "kurs": ordner_name}
+                if ziel not in ordner_cache:
+                    ordner_cache[ziel] = finde_oder_erstelle_ordner(drive, ziel, ROOT_FOLDER)
+                lade_hoch(drive, inhalt, dateiname, mime, ordner_cache[ziel])
+                bekannte[key] = {"name": dateiname, "kurs": ziel}
                 neue_im_kurs.append(dateiname)
-                print(f"✅ {ordner_name}/{dateiname}")
+                print(f"  ✅ {ziel}/{dateiname}", flush=True)
             except Exception as e:
-                print(f"⚠️ Drive-Fehler {dateiname}: {e}")
-                continue
+                print(f"  ⚠️ Drive-Fehler {dateiname}: {e}", flush=True)
 
         if neue_im_kurs:
             liste = "\n".join(f"  📄 {n}" for n in neue_im_kurs)
-            sende_telegram(
-                f"📚 <b>Neue Dateien – {ordner_name}</b>\n{liste}\n\n"
-                f"<i>→ Google Drive: Schule/{ordner_name}/</i>"
-            )
+            telegram(f"📚 <b>Neue Dateien – {ziel}</b>\n{liste}\n\n<i>→ Google Drive: Schule/{ziel}/</i>")
             neue_gesamt += len(neue_im_kurs)
 
-    speichere_bekannte(bekannte)
-    print(f"✅ Fertig – {neue_gesamt} neue Dateien hochgeladen.")
+    json.dump(bekannte, open(KNOWN_FILE, "w"), indent=2)
+    print(f"✅ Fertig – {neue_gesamt} neue Dateien hochgeladen.", flush=True)
 
 if __name__ == "__main__":
     main()
