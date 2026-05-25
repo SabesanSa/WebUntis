@@ -54,9 +54,12 @@ async function handleNachricht(env, chatId, text) {
     return;
   }
 
-  // ── Moodle-Check ─────────────────────────────────────────────────────────
+
   if (t === 'moodle' || t === '/moodle') {
-    await sendeTelegram(env, chatId, '📚 Moodle-Check wird gestartet – neue Dateien landen gleich in Google Drive!');
+    const ok = await setzeMoodleTrigger(env);
+    await sendeTelegram(env, chatId, ok
+      ? '📚 Moodle-Check wird gestartet – Dateien landen in ~1 Minute in Drive!'
+      : '❌ Moodle-Trigger konnte nicht gesetzt werden.');
     return;
   }
 
@@ -357,4 +360,36 @@ function hilfeText() {
 • <b>moodle</b> – Moodle auf neue Dateien prüfen
 
 ❓ <b>hilfe</b> – diese Übersicht`;
+}
+
+// ── Moodle Trigger via GitHub ─────────────────────────────────────────────────
+
+async function setzeMoodleTrigger(env) {
+  const apiUrl = `https://api.github.com/repos/${env.GITHUB_USERNAME}/WebUntis/contents/moodle-trigger.json`;
+  const headers = {
+    'Authorization': `Bearer ${env.GITHUB_TOKEN}`,
+    'Accept': 'application/vnd.github+json',
+    'Content-Type': 'application/json',
+    'User-Agent': 'schul-bot'
+  };
+
+  // Aktuellen SHA holen
+  const get = await fetch(apiUrl, { headers });
+  if (!get.ok) return false;
+  const data = await get.json();
+  const sha  = data.sha;
+
+  // Trigger setzen
+  const inhalt  = JSON.stringify({ trigger: true });
+  const encoded = btoa(inhalt);
+  const put = await fetch(apiUrl, {
+    method: 'PUT',
+    headers,
+    body: JSON.stringify({
+      message: 'trigger=true',
+      content: encoded,
+      sha
+    })
+  });
+  return put.status === 200 || put.status === 201;
 }
