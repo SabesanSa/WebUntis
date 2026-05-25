@@ -34,4 +34,5 @@ jobs:
           TELEGRAM_CHAT_ID:          ${{ secrets.TELEGRAM_CHAT_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           DRIVE_ROOT_FOLDER_ID:      ${{ secrets.DRIVE_ROOT_FOLDER_ID }}
-        run: python moodle-check.py
+        run: python -u moodle-check.py
+
