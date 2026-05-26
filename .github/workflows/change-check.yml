@@ -1,0 +1,51 @@
+name: 📢 Stundenplan-Änderungen
+
+on:
+  schedule:
+    # Täglich nach dem Stundenplan-Sync (sync.yml läuft 05:00 UTC)
+    - cron: "30 5 * * *"    # 07:30 Berlin – direkt nach Sync
+
+    # Zusätzlicher Mittags-Check (fängt Änderungen aus dem Tagesverlauf)
+    - cron: "0 11 * * 1-5"  # 13:00 Berlin (Werktage)
+  workflow_dispatch:
+
+jobs:
+  change-check:
+    name: Stundenplan-Änderungen prüfen
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - run: npm install
+
+      # Snapshot aus dem letzten Lauf wiederherstellen
+      - name: 📸 Stundenplan-Snapshot laden
+        id: cache-snapshot
+        uses: actions/cache@v4
+        with:
+          path: stundenplan-snapshot.json
+          key: stundenplan-snapshot-v1
+          restore-keys: stundenplan-snapshot-v1
+
+      - name: 🔍 Änderungen prüfen
+        env:
+          NOTION_TOKEN:       ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          GITHUB_EVENT_NAME:  ${{ github.event_name }}
+        run: node change-check.js
+
+      # Aktualisierten Snapshot speichern (immer, auch bei Fehlern)
+      - name: 💾 Snapshot speichern
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: stundenplan-snapshot.json
+          key: stundenplan-snapshot-v1
