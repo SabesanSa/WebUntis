@@ -23,7 +23,7 @@ const SNAPSHOT_FILE = 'stundenplan-snapshot.json';
 const IGNORIEREN    = ['AG Bienen', 'Vertiefung', 'Freier Tag', 'Ferien'];
 
 // Nur Änderungen für die nächsten N Tage sind meldepflichtig
-const ALERT_HORIZONT_TAGE = 3;
+const ALERT_HORIZONT_TAGE = 14;
 
 // ── HTTP-Helfer ───────────────────────────────────────────────────────────────
 
