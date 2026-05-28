@@ -84,13 +84,16 @@ function decodeEntities(str) {
 
 // Einzelner Fetch mit Timeout (AbortController) und Retry bei 5xx/522/Timeout.
 // Schul-Infrastruktur (Cloudflare-Origin) liefert sporadisch 522 – das fangen wir hier ab.
-async function fetchWithTimeout(url, options, timeoutMs = 10_000, retries = 2) {
+async function fetchWithTimeout(url, options, timeoutMs = 15_000, retries = 3) {
   let lastErr;
   for (let attempt = 1; attempt <= retries; attempt++) {
     const ctrl  = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
+      const t0 = Date.now();
       const resp = await fetch(url, { ...options, signal: ctrl.signal });
+      const dt = Date.now() - t0;
+      if (dt > 3000) console.log(`[slow-fetch] ${dt}ms ${url.slice(0, 60)}`);
       clearTimeout(timer);
       // Cloudflare-Origin-Fehler (520–527, 502/503/504) → kurz warten & erneut
       if (resp.status >= 520 || resp.status === 502 || resp.status === 503 || resp.status === 504) {
@@ -362,6 +365,20 @@ async function handleMoodleRequest(request, env, url) {
         }
       } catch(e) { info.error = e.message; }
       return Response.json({ ok: true, info });
+    }
+
+    // ── GET /moodle/colo – wo läuft der Worker + Moodle-Reachability-Test ────
+    if (path === '/moodle/colo') {
+      const colo = request.cf?.colo ?? '?';
+      const country = request.cf?.country ?? '?';
+      let moodleStatus, moodleTime;
+      try {
+        const t0 = Date.now();
+        const r = await fetchWithTimeout(`${MOODLE_URL}/login/index.php`, { redirect: 'manual' }, 15_000, 1);
+        moodleTime = Date.now() - t0;
+        moodleStatus = r.status;
+      } catch (e) { moodleStatus = `ERR: ${e.message}`; }
+      return Response.json({ ok: true, colo, country, moodleStatus, moodleTime });
     }
 
     // ── POST /moodle/login (erzwingt neuen Login, löscht KV-Cache) ───────────

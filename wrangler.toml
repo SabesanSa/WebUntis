@@ -2,6 +2,11 @@ name = "schul-bot"
 main = "telegram-bot-worker.js"
 compatibility_date = "2025-01-01"
 
+# Smart Placement: Worker läuft nahe am Backend (deutscher Schulserver),
+# nicht beim Aufrufer (Railway/US). Behebt 522-Fehler durch US-Cloudflare-IPs.
+[placement]
+mode = "smart"
+
 # KV-Namespace für Moodle-Session-Cache
 # Nach "wrangler kv:namespace create moodle_session" ausführen:
 # Die ausgegebene ID hier eintragen.
