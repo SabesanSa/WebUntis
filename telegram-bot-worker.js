@@ -325,6 +325,19 @@ async function handleMoodleRequest(request, env, url) {
     return Response.json({ ok: false, error: 'Unauthorized' }, { status: 401 });
   }
 
+  // An Durable Object in Westeuropa weiterleiten – der Schulserver blockt
+  // US-Cloudflare-Colos (522). Das DO erzwingt die Ausführung in der EU,
+  // egal woher der Aufruf kommt (z.B. Railway/US).
+  if (env.MOODLE_DO) {
+    const id   = env.MOODLE_DO.idFromName('eu');
+    const stub = env.MOODLE_DO.get(id, { locationHint: 'weur' });
+    return stub.fetch(request);
+  }
+  return handleMoodleOp(request, env, url);
+}
+
+// Eigentliche Moodle-Logik – läuft im DO (Westeuropa) → EU-Colo-Egress zu Moodle
+async function handleMoodleOp(request, env, url) {
   const MOODLE_URL = (env.MOODLE_URL ?? '').replace(/\/$/, '');
   const path       = url.pathname;
 
@@ -491,6 +504,19 @@ async function handleMoodleRequest(request, env, url) {
   } catch (err) {
     console.error('[Moodle-Proxy] Fehler:', err);
     return Response.json({ ok: false, error: err.message }, { status: 500 });
+  }
+}
+
+// ── Durable Object: führt die Moodle-Logik in Westeuropa aus ──────────────────
+// Wird per locationHint 'weur' in der EU gepinnt, damit der Egress zum
+// Schulserver aus einem EU-Colo kommt (US-Colos werden mit 522 geblockt).
+export class MoodleDO {
+  constructor(state, env) {
+    this.state = state;
+    this.env   = env;
+  }
+  async fetch(request) {
+    return handleMoodleOp(request, this.env, new URL(request.url));
   }
 }
 

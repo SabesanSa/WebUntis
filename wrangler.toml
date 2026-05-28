@@ -2,10 +2,17 @@ name = "schul-bot"
 main = "telegram-bot-worker.js"
 compatibility_date = "2025-01-01"
 
-# Smart Placement: Worker läuft nahe am Backend (deutscher Schulserver),
-# nicht beim Aufrufer (Railway/US). Behebt 522-Fehler durch US-Cloudflare-IPs.
-[placement]
-mode = "smart"
+# Durable Object für Moodle-Anfragen – per locationHint 'weur' in Westeuropa
+# gepinnt, damit der Egress zum Schulserver aus einem EU-Colo kommt
+# (US-Colos werden vom Schulserver mit 522 geblockt).
+[[durable_objects.bindings]]
+name = "MOODLE_DO"
+class_name = "MoodleDO"
+
+# SQLite-Backend → nötig damit DOs auch im kostenlosen Workers-Plan laufen
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["MoodleDO"]
 
 # KV-Namespace für Moodle-Session-Cache
 # Nach "wrangler kv:namespace create moodle_session" ausführen:
