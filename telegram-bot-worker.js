@@ -336,6 +336,112 @@ async function handleMoodleRequest(request, env, url) {
   return handleMoodleOp(request, env, url);
 }
 
+// ── Kursinhalte (core_courseformat_get_state + Datei-Auflösung) ───────────────
+
+// Wiederverwendbarer AJAX-Aufruf (gibt item.data zurück, wirft bei Fehler)
+async function moodleAjaxRaw(MOODLE_URL, session, methodname, args) {
+  const resp = await fetchWithTimeout(
+    `${MOODLE_URL}/lib/ajax/service.php?sesskey=${session.sesskey}&info=${methodname}`,
+    {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json', 'Cookie': session.cookie, 'X-Requested-With': 'XMLHttpRequest', 'User-Agent': 'Mozilla/5.0' },
+      body:    JSON.stringify([{ index: 0, methodname, args }]),
+    }
+  );
+  const text = await resp.text();
+  let result;
+  try { result = JSON.parse(text); }
+  catch { throw new Error(`Moodle antwortete nicht mit JSON (HTTP ${resp.status})`); }
+  const item = result?.[0];
+  if (!item) throw new Error('Leere AJAX-Antwort');
+  if (item.error) { const e = new Error(`AJAX: ${JSON.stringify(item.exception)}`); e.sessionExpired = true; throw e; }
+  return item.data;
+}
+
+function fileNameFromUrl(u) {
+  try { return decodeURIComponent(new URL(u).pathname.split('/').pop() || ''); }
+  catch { return ''; }
+}
+function mimeFromName(n) {
+  const e = (n.split('.').pop() || '').toLowerCase();
+  const m = {
+    pdf:'application/pdf', doc:'application/msword',
+    docx:'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    xls:'application/vnd.ms-excel', xlsx:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    ppt:'application/vnd.ms-powerpoint', pptx:'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    txt:'text/plain', csv:'text/csv', html:'text/html', json:'application/json',
+    png:'image/png', jpg:'image/jpeg', jpeg:'image/jpeg', gif:'image/gif', zip:'application/zip',
+  };
+  return m[e] || 'application/octet-stream';
+}
+
+// Löst die echten pluginfile-URLs eines resource/folder-Moduls auf
+async function resolveModuleFiles(session, mod) {
+  const headers = { 'Cookie': session.cookie, 'User-Agent': 'Mozilla/5.0' };
+  const out = [];
+  const seen = new Set();
+  const add = (u) => {
+    const clean = u.replace(/&amp;/g, '&').split('?')[0];
+    if (!/\/mod_(resource|folder)\/content\//.test(clean)) return; // nur echte Inhaltsdateien
+    if (seen.has(clean)) return;
+    seen.add(clean);
+    const name = fileNameFromUrl(clean);
+    if (!name) return;
+    out.push({ type:'file', filename:name, filepath:'/', filesize:0,
+      fileurl:clean, timecreated:0, timemodified:0, sortorder:0, mimetype:mimeFromName(name) });
+  };
+
+  if (mod.modname === 'resource') {
+    // Bei "Download erzwingen" → 303 direkt zur pluginfile-URL
+    const r = await fetchWithTimeout(mod.url, { headers, redirect: 'manual' }, 12_000, 2);
+    if ([301,302,303,307,308].includes(r.status)) {
+      const loc = r.headers.get('location');
+      if (loc && loc.includes('pluginfile.php')) { add(loc); return out; }
+    }
+    // Sonst: Anzeige-Seite parsen
+    const r2 = await fetchWithTimeout(mod.url, { headers }, 12_000, 2);
+    const html = await r2.text();
+    for (const m of html.matchAll(/https?:\/\/[^"'\s)<>]+pluginfile\.php\/[^"'\s)<>]+/g)) add(m[0]);
+  } else if (mod.modname === 'folder') {
+    const r = await fetchWithTimeout(mod.url, { headers }, 12_000, 2);
+    const html = await r.text();
+    for (const m of html.matchAll(/https?:\/\/[^"'\s)<>]+pluginfile\.php\/[^"'\s)<>]+/g)) add(m[0]);
+  }
+  return out;
+}
+
+// Baut die komplette Kursstruktur inkl. aufgelöster Dateien
+async function buildCourseContents(MOODLE_URL, session, courseId) {
+  const raw = await moodleAjaxRaw(MOODLE_URL, session, 'core_courseformat_get_state', { courseid: courseId });
+  const state = typeof raw === 'string' ? JSON.parse(raw) : raw;
+  const cmById = new Map();
+  for (const cm of state.cm ?? []) cmById.set(String(cm.id), cm);
+
+  const sections = (state.section ?? [])
+    .sort((a, b) => (a.number ?? a.section) - (b.number ?? b.section))
+    .map((s) => ({
+      id: Number(s.id), name: s.title || `Abschnitt ${s.number ?? s.section}`,
+      section: s.number ?? s.section, visible: s.visible ? 1 : 0, uservisible: !!s.visible, summary: '',
+      modules: (s.cmlist ?? [])
+        .map((id) => cmById.get(String(id)))
+        .filter(Boolean)
+        .map((cm) => ({
+          id: Number(cm.id), name: cm.name, modname: cm.module, url: cm.url,
+          visible: cm.visible ? 1 : 0, uservisible: cm.uservisible ?? cm.visible, contents: [],
+        })),
+    }));
+
+  // Dateien für resource/folder-Module parallel auflösen (gedeckelt)
+  const fileMods = [];
+  for (const s of sections) for (const m of s.modules)
+    if ((m.modname === 'resource' || m.modname === 'folder') && m.url) fileMods.push(m);
+  await Promise.all(fileMods.slice(0, 40).map(async (m) => {
+    try { m.contents = await resolveModuleFiles(session, m); } catch { m.contents = []; }
+  }));
+
+  return sections;
+}
+
 // Eigentliche Moodle-Logik – läuft im DO (Westeuropa) → EU-Colo-Egress zu Moodle
 async function handleMoodleOp(request, env, url) {
   const MOODLE_URL = (env.MOODLE_URL ?? '').replace(/\/$/, '');
@@ -392,6 +498,27 @@ async function handleMoodleOp(request, env, url) {
         moodleStatus = r.status;
       } catch (e) { moodleStatus = `ERR: ${e.message}`; }
       return Response.json({ ok: true, colo, country, moodleStatus, moodleTime });
+    }
+
+    // ── GET /moodle/course_contents?courseid=... ─────────────────────────────
+    // Kursstruktur via core_courseformat_get_state + aufgelöste Datei-URLs
+    if (path === '/moodle/course_contents') {
+      const courseId = url.searchParams.get('courseid');
+      if (!courseId) return Response.json({ ok: false, error: 'courseid fehlt' }, { status: 400 });
+
+      let session = await getOrCreateSession(env);
+      let sections;
+      try {
+        sections = await buildCourseContents(MOODLE_URL, session, Number(courseId));
+      } catch (e) {
+        // Session abgelaufen → einmal frisch einloggen und erneut versuchen
+        if (e.sessionExpired) {
+          if (env.MOODLE_KV) await env.MOODLE_KV.delete('session');
+          session  = await getOrCreateSession(env);
+          sections = await buildCourseContents(MOODLE_URL, session, Number(courseId));
+        } else throw e;
+      }
+      return Response.json({ ok: true, data: sections });
     }
 
     // ── POST /moodle/login (erzwingt neuen Login, löscht KV-Cache) ───────────
