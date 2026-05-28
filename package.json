@@ -1,9 +1,16 @@
 {
   "name": "webuntis-notion-sync",
   "version": "1.0.0",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
   "dependencies": {
     "@notionhq/client": "^2.2.15",
-    "playwright": "^1.44.0",
-    "google-auth-library": "^9.0.0"
+    "google-auth-library": "^9.0.0",
+    "playwright": "^1.44.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.95.0"
   }
 }

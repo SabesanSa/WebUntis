@@ -1,3 +1,26 @@
 name = "schul-bot"
 main = "telegram-bot-worker.js"
 compatibility_date = "2025-01-01"
+
+# KV-Namespace für Moodle-Session-Cache
+# Nach "wrangler kv:namespace create moodle_session" ausführen:
+# Die ausgegebene ID hier eintragen.
+[[kv_namespaces]]
+binding = "MOODLE_KV"
+id = "PLACEHOLDER_KV_ID"
+
+# Öffentliche Variablen (kein Geheimnis)
+[vars]
+MOODLE_URL = "https://dortmund.abitur-online.net"
+
+# Geheime Variablen müssen per CLI gesetzt werden:
+#   wrangler secret put MOODLE_USERNAME
+#   wrangler secret put MOODLE_PASSWORD
+#   wrangler secret put WORKER_KEY
+#   wrangler secret put TELEGRAM_BOT_TOKEN
+#   wrangler secret put TELEGRAM_CHAT_ID
+#   wrangler secret put NOTION_TOKEN
+#   wrangler secret put NOTION_DATABASE_ID
+#   wrangler secret put GOOGLE_SERVICE_ACCOUNT_JSON
+#   wrangler secret put GITHUB_TOKEN
+#   wrangler secret put GITHUB_USERNAME

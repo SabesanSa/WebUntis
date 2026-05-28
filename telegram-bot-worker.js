@@ -1,6 +1,14 @@
-// Cloudflare Worker – Telegram Bot für Schul-Abfragen
+// Cloudflare Worker – Telegram Bot + Moodle-Proxy für Schul-Abfragen
 export default {
   async fetch(request, env) {
+    const url = new URL(request.url);
+
+    // ── Moodle-Proxy-Routen (/moodle/*) ────────────────────────────────────────
+    if (url.pathname.startsWith('/moodle/')) {
+      return handleMoodleRequest(request, env, url);
+    }
+
+    // ── Telegram-Bot ────────────────────────────────────────────────────────────
     if (request.method !== 'POST') return new Response('OK');
     try {
       const body = await request.json();
@@ -16,6 +24,355 @@ export default {
     return new Response('OK');
   }
 };
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MOODLE-PROXY
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── SimpleCookieJar (ohne tough-cookie, für Cloudflare Workers) ───────────────
+
+class SimpleCookieJar {
+  constructor() { this._cookies = {}; /* domain -> [{name,value,path}] */ }
+
+  addCookie(setCookieStr, requestUrl) {
+    if (!setCookieStr) return;
+    const domain = new URL(requestUrl).hostname;
+    const parts  = setCookieStr.split(';');
+    const nv     = parts[0].trim();
+    const eq     = nv.indexOf('=');
+    if (eq === -1) return;
+    const name  = nv.slice(0, eq).trim();
+    const value = nv.slice(eq + 1).trim();
+
+    let cookieDomain = domain, path = '/';
+    for (const attr of parts.slice(1)) {
+      const a = attr.trim();
+      if (/^domain=/i.test(a)) {
+        let d = a.slice(7).trim();
+        if (d.startsWith('.')) d = d.slice(1);
+        cookieDomain = d;
+      }
+      if (/^path=/i.test(a)) path = a.slice(5).trim();
+    }
+
+    if (!this._cookies[cookieDomain]) this._cookies[cookieDomain] = [];
+    this._cookies[cookieDomain] = this._cookies[cookieDomain].filter(c => c.name !== name);
+    if (value !== '') this._cookies[cookieDomain].push({ name, value, path });
+  }
+
+  getCookieString(url) {
+    const hostname = new URL(url).hostname;
+    const result   = [];
+    for (const [d, cookies] of Object.entries(this._cookies)) {
+      if (hostname === d || hostname.endsWith('.' + d)) {
+        for (const c of cookies) result.push(`${c.name}=${c.value}`);
+      }
+    }
+    return result.join('; ');
+  }
+}
+
+function decodeEntities(str) {
+  return (str ?? '')
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n));
+}
+
+// ── proxyFetch – fetch() mit manuellem Redirect-Follow und CookieJar ──────────
+
+async function proxyFetch(jar, url, method = 'GET', extraHeaders = {}, body = null, maxRedirects = 15) {
+  let currentUrl    = url;
+  let currentMethod = method;
+  let currentBody   = body;
+  let redirects     = 0;
+
+  const baseHeaders = {
+    'User-Agent':              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept':                  'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'Accept-Language':         'de-DE,de;q=0.9,en;q=0.8',
+    'Upgrade-Insecure-Requests': '1',
+  };
+
+  while (redirects <= maxRedirects) {
+    const cookieStr = jar.getCookieString(currentUrl);
+    const headers   = { ...baseHeaders, ...extraHeaders };
+    if (cookieStr) headers['Cookie'] = cookieStr;
+
+    const resp = await fetch(currentUrl, {
+      method:   currentMethod,
+      headers,
+      body:     currentBody || undefined,
+      redirect: 'manual',
+    });
+
+    // Set-Cookie sammeln (Cloudflare-spezifisch: getAll('set-cookie'))
+    try {
+      for (const sc of resp.headers.getAll('set-cookie')) jar.addCookie(sc, currentUrl);
+    } catch {
+      const sc = resp.headers.get('set-cookie');
+      if (sc) jar.addCookie(sc, currentUrl);
+    }
+
+    const status = resp.status;
+    if ([301, 302, 303, 307, 308].includes(status) && redirects < maxRedirects) {
+      const loc = resp.headers.get('location');
+      if (!loc) break;
+      currentUrl = new URL(loc, currentUrl).toString();
+      if (status <= 303) { currentMethod = 'GET'; currentBody = null; }
+      redirects++;
+      continue;
+    }
+
+    return { url: currentUrl, status, body: await resp.text() };
+  }
+  throw new Error(`Zu viele Weiterleitungen (${redirects})`);
+}
+
+// ── Sesskey / UserId extrahieren ──────────────────────────────────────────────
+
+function extractSesskey(html) {
+  const patterns = [
+    /"sesskey"\s*:\s*"([a-zA-Z0-9]+)"/,
+    /<input[^>]+name=["']sesskey["'][^>]+value=["']([a-zA-Z0-9]+)["']/i,
+    /sesskey["']\s*:\s*["']([a-zA-Z0-9]{10,})["']/,
+  ];
+  for (const p of patterns) { const m = html.match(p); if (m?.[1]) return m[1]; }
+  return null;
+}
+
+function extractUserId(html) {
+  const m = html.match(/"userid"\s*:\s*(\d+)/) ?? html.match(/data-userid=["'](\d+)["']/i);
+  return m ? +m[1] : 0;
+}
+
+// ── Logineo SSO (vollständiger SAML-2.0-Flow) ─────────────────────────────────
+
+async function doLogineoLogin(env) {
+  const MOODLE_URL = (env.MOODLE_URL ?? '').replace(/\/$/, '');
+  const jar        = new SimpleCookieJar();
+
+  // Schritt 1: GET Moodle-Login → folgt Redirects zum Logineo-IdP
+  const r1     = await proxyFetch(jar, `${MOODLE_URL}/login/index.php`);
+  const idpBase = new URL(r1.url).origin;
+  const html1  = r1.body;
+
+  const csrfM = html1.match(/<input[^>]+name=["']csrf_token["'][^>]+value=["']([^"']+)["']/i)
+             ?? html1.match(/<input[^>]+value=["']([^"']+)["'][^>]+name=["']csrf_token["']/i);
+  const csrf  = csrfM?.[1] ?? '';
+
+  const actionM = html1.match(/<form[^>]+action=["']([^"']+)["']/i);
+  let   action  = decodeEntities(actionM?.[1] ?? '');
+  if (action && !action.startsWith('http')) action = idpBase + action;
+  if (!action) throw new Error('[Login] Kein Login-Formular gefunden');
+
+  await new Promise(r => setTimeout(r, 500));
+
+  // Schritt 2: Credentials an Logineo-IdP
+  const r2   = await proxyFetch(jar, action, 'POST', {
+    'Content-Type': 'application/x-www-form-urlencoded',
+    'Referer':           r1.url,
+    'Origin':            idpBase,
+    'Sec-Fetch-Dest':   'document',
+    'Sec-Fetch-Mode':   'navigate',
+    'Sec-Fetch-Site':   'same-origin',
+    'Sec-Fetch-User':   '?1',
+  }, new URLSearchParams({
+    csrf_token: csrf, j_username: env.MOODLE_USERNAME, j_password: env.MOODLE_PASSWORD, _eventId_proceed: '',
+  }).toString());
+
+  const html2 = r2.body;
+  const samlM = html2.match(/<input[^>]+name=["']SAMLResponse["'][^>]+value=["']([^"']+)["']/i)
+             ?? html2.match(/<input[^>]+value=["']([^"']+)["'][^>]+name=["']SAMLResponse["']/i);
+  const relayM = html2.match(/<input[^>]+name=["']RelayState["'][^>]+value=["']([^"']+)["']/i)
+              ?? html2.match(/<input[^>]+value=["']([^"']+)["'][^>]+name=["']RelayState["']/i);
+  const acsM  = html2.match(/<form[^>]+action=["']([^"']+)["']/i);
+
+  if (!samlM?.[1]) {
+    const errM = html2.match(/<[^>]*class=["'][^"']*(?:error|alert)[^"']*["'][^>]*>([\s\S]{0,300}?)<\//i);
+    const errT = errM?.[1]?.replace(/<[^>]+>/g, '').trim() ?? 'SAMLResponse nicht gefunden';
+    throw new Error(`[Login] Logineo fehlgeschlagen: ${errT}`);
+  }
+
+  const samlResponse = samlM[1];
+  const relayState   = decodeEntities(relayM?.[1] ?? '');
+  const acsUrl       = decodeEntities(acsM?.[1] ?? '');
+  if (!acsUrl) throw new Error('[Login] ACS-URL nicht gefunden');
+
+  // Schritt 3: SAMLResponse an Moodle ACS
+  const r3 = await proxyFetch(jar, acsUrl, 'POST', {
+    'Content-Type': 'application/x-www-form-urlencoded',
+    'Referer': r2.url, 'Origin': idpBase,
+    'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate', 'Sec-Fetch-Site': 'cross-site',
+  }, new URLSearchParams({ SAMLResponse: samlResponse, RelayState: relayState }).toString());
+
+  // Schritt 4: sesskey extrahieren
+  let sesskey = extractSesskey(r3.body);
+  let userId  = extractUserId(r3.body);
+
+  if (!sesskey) {
+    const dash = await proxyFetch(jar, `${MOODLE_URL}/my/`);
+    sesskey = extractSesskey(dash.body);
+    userId  = extractUserId(dash.body) || userId;
+  }
+
+  if (!sesskey) throw new Error('[Login] sesskey nach Login nicht gefunden');
+
+  console.log(`[Moodle] ✅ Login OK | sesskey: ${sesskey.slice(0, 8)}... | userId: ${userId}`);
+  return { sesskey, userId, cookie: jar.getCookieString(MOODLE_URL) };
+}
+
+// ── KV-Session-Cache ──────────────────────────────────────────────────────────
+
+async function getOrCreateSession(env) {
+  if (env.MOODLE_KV) {
+    const cached = await env.MOODLE_KV.get('session', 'json');
+    if (cached?.sesskey && cached?.expiry > Date.now()) return cached;
+  }
+
+  const session = await doLogineoLogin(env);
+  session.expiry = Date.now() + 28 * 60 * 1000;
+
+  if (env.MOODLE_KV) {
+    await env.MOODLE_KV.put('session', JSON.stringify(session), { expirationTtl: 1800 });
+  }
+  return session;
+}
+
+// ── flattenParams (wie in moodleClient.ts) ────────────────────────────────────
+
+function flattenParams(obj, form, prefix = '') {
+  for (const [key, val] of Object.entries(obj)) {
+    const k = prefix ? `${prefix}[${key}]` : key;
+    if (Array.isArray(val)) {
+      val.forEach((item, i) => {
+        if (typeof item === 'object' && item !== null) flattenParams(item, form, `${k}[${i}]`);
+        else form.append(`${k}[${i}]`, String(item));
+      });
+    } else if (typeof val === 'object' && val !== null) {
+      flattenParams(val, form, k);
+    } else if (val !== undefined && val !== null) {
+      form.append(k, String(val));
+    }
+  }
+}
+
+// ── Base64-Encoding für große ArrayBuffer ─────────────────────────────────────
+
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  const CHUNK = 8192;
+  let   binary = '';
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+}
+
+// ── Moodle-Request-Handler ────────────────────────────────────────────────────
+
+async function handleMoodleRequest(request, env, url) {
+  // API-Key prüfen
+  const workerKey = request.headers.get('x-worker-key') ?? '';
+  if (!env.WORKER_KEY || workerKey !== env.WORKER_KEY) {
+    return Response.json({ ok: false, error: 'Unauthorized' }, { status: 401 });
+  }
+
+  const MOODLE_URL = (env.MOODLE_URL ?? '').replace(/\/$/, '');
+  const path       = url.pathname;
+
+  try {
+    // ── GET /moodle/health ───────────────────────────────────────────────────
+    if (path === '/moodle/health') {
+      return Response.json({ ok: true, moodle: !!MOODLE_URL });
+    }
+
+    // ── POST /moodle/login (erzwingt neuen Login, löscht KV-Cache) ───────────
+    if (path === '/moodle/login') {
+      if (env.MOODLE_KV) await env.MOODLE_KV.delete('session');
+      const session = await getOrCreateSession(env);
+      return Response.json({ ok: true, sesskey: session.sesskey, userId: session.userId });
+    }
+
+    // ── POST /moodle/ajax ────────────────────────────────────────────────────
+    if (path === '/moodle/ajax') {
+      const session = await getOrCreateSession(env);
+      const { methodname, args } = await request.json();
+
+      const resp = await fetch(
+        `${MOODLE_URL}/lib/ajax/service.php?sesskey=${session.sesskey}&info=${methodname}`,
+        {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json', 'Cookie': session.cookie, 'X-Requested-With': 'XMLHttpRequest', 'User-Agent': 'Mozilla/5.0' },
+          body:    JSON.stringify([{ index: 0, methodname, args }]),
+        }
+      );
+      const result = await resp.json();
+      const item   = result?.[0];
+
+      if (!item) return Response.json({ ok: false, error: 'Leere AJAX-Antwort' }, { status: 502 });
+      if (item.error) {
+        if (env.MOODLE_KV) await env.MOODLE_KV.delete('session'); // Session abgelaufen
+        return Response.json({ ok: false, error: `AJAX: ${JSON.stringify(item.exception)}`, sessionExpired: true }, { status: 401 });
+      }
+      return Response.json({ ok: true, data: item.data });
+    }
+
+    // ── POST /moodle/rest ────────────────────────────────────────────────────
+    if (path === '/moodle/rest') {
+      const session = await getOrCreateSession(env);
+      const { wsfunction, params } = await request.json();
+
+      const form = new URLSearchParams();
+      form.append('sesskey', session.sesskey);
+      form.append('wsfunction', wsfunction);
+      form.append('moodlewsrestformat', 'json');
+      flattenParams(params ?? {}, form);
+
+      const resp = await fetch(`${MOODLE_URL}/webservice/rest/server.php`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Cookie': session.cookie, 'User-Agent': 'Mozilla/5.0' },
+        body:    form,
+      });
+      const data = await resp.json();
+      if (data?.exception) return Response.json({ ok: false, error: data.message ?? 'REST-Fehler' }, { status: 502 });
+      return Response.json({ ok: true, data });
+    }
+
+    // ── GET /moodle/download?url=... ─────────────────────────────────────────
+    if (path === '/moodle/download') {
+      const session   = await getOrCreateSession(env);
+      const fileUrl   = url.searchParams.get('url');
+      if (!fileUrl) return Response.json({ ok: false, error: 'url-Parameter fehlt' }, { status: 400 });
+
+      const dlUrl = fileUrl.replace('/webservice/pluginfile.php/', '/pluginfile.php/').split('?')[0];
+
+      const resp = await fetch(dlUrl, {
+        headers: { 'Cookie': session.cookie, 'User-Agent': 'Mozilla/5.0' },
+      });
+      if (!resp.ok) return Response.json({ ok: false, error: `Download ${resp.status}` }, { status: 502 });
+
+      const buffer      = await resp.arrayBuffer();
+      const base64      = arrayBufferToBase64(buffer);
+      const contentType = resp.headers.get('content-type') ?? 'application/octet-stream';
+      const cd          = resp.headers.get('content-disposition') ?? '';
+      const fnM         = cd.match(/filename[^;=\n]*=["\']?([^"\';\n]+)/);
+      const filename    = fnM?.[1]?.trim() ?? '';
+
+      return Response.json({ ok: true, data: base64, contentType, filename });
+    }
+
+    return Response.json({ ok: false, error: `Unbekannter Pfad: ${path}` }, { status: 404 });
+
+  } catch (err) {
+    console.error('[Moodle-Proxy] Fehler:', err);
+    return Response.json({ ok: false, error: err.message }, { status: 500 });
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TELEGRAM-BOT
+// ══════════════════════════════════════════════════════════════════════════════
 
 async function handleNachricht(env, chatId, text) {
   const t = text.toLowerCase().trim();
