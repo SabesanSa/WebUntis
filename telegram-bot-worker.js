@@ -384,29 +384,37 @@ async function resolveModuleFiles(session, mod) {
     const clean = u.replace(/&amp;/g, '&').split('?')[0];
     if (!/\/mod_(resource|folder)\/content\//.test(clean)) return; // nur echte Inhaltsdateien
     if (seen.has(clean)) return;
-    seen.add(clean);
     const name = fileNameFromUrl(clean);
     if (!name) return;
+    // Web-Embed-Artefakte aus H5P/digiscreen-Bundles überspringen
+    if (/^(iframe|index)\.html$/i.test(name) || /\.(js|css|map)$/i.test(name)) return;
+    seen.add(clean);
     out.push({ type:'file', filename:name, filepath:'/', filesize:0,
       fileurl:clean, timecreated:0, timemodified:0, sortorder:0, mimetype:mimeFromName(name) });
   };
 
+  let resolved = false;
   if (mod.modname === 'resource') {
     // Bei "Download erzwingen" → 303 direkt zur pluginfile-URL
     const r = await fetchWithTimeout(mod.url, { headers, redirect: 'manual' }, 12_000, 2);
     if ([301,302,303,307,308].includes(r.status)) {
       const loc = r.headers.get('location');
-      if (loc && loc.includes('pluginfile.php')) { add(loc); return out; }
+      if (loc && loc.includes('pluginfile.php')) { add(loc); resolved = true; }
     }
-    // Sonst: Anzeige-Seite parsen
-    const r2 = await fetchWithTimeout(mod.url, { headers }, 12_000, 2);
-    const html = await r2.text();
-    for (const m of html.matchAll(/https?:\/\/[^"'\s)<>]+pluginfile\.php\/[^"'\s)<>]+/g)) add(m[0]);
+    if (!resolved) {
+      // Sonst: Anzeige-Seite parsen
+      const r2 = await fetchWithTimeout(mod.url, { headers }, 12_000, 2);
+      const html = await r2.text();
+      for (const m of html.matchAll(/https?:\/\/[^"'\s)<>]+pluginfile\.php\/[^"'\s)<>]+/g)) add(m[0]);
+    }
   } else if (mod.modname === 'folder') {
     const r = await fetchWithTimeout(mod.url, { headers }, 12_000, 2);
     const html = await r.text();
     for (const m of html.matchAll(/https?:\/\/[^"'\s)<>]+pluginfile\.php\/[^"'\s)<>]+/g)) add(m[0]);
   }
+
+  // (Dateigröße wird von Moodle bei diesen Requests nicht zuverlässig geliefert
+  //  → bleibt 0; die Anzeige zeigt dann "–" statt einer irreführenden Größe.)
   return out;
 }
 
@@ -454,36 +462,6 @@ async function handleMoodleOp(request, env, url) {
         ok: true, moodle: !!MOODLE_URL,
         hasUsername: !!env.MOODLE_USERNAME, hasPassword: !!env.MOODLE_PASSWORD,
       });
-    }
-
-    // ── GET /moodle/debug – Redirect-Kette bis zum IdP-Formular ─────────────
-    if (path === '/moodle/debug') {
-      const info = { moodleUrl: MOODLE_URL, hasUsername: !!env.MOODLE_USERNAME, hasPassword: !!env.MOODLE_PASSWORD };
-      const hdrs = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', 'Accept': 'text/html,*/*' };
-      try {
-        // Schritt 1
-        const r1 = await fetch(`${MOODLE_URL}/login/index.php`, { redirect: 'manual', headers: hdrs });
-        info.s1 = { status: r1.status, location: r1.headers.get('location') };
-
-        // Schritt 2 – folge dem Redirect manuell
-        if (r1.status >= 300 && r1.status < 400 && r1.headers.get('location')) {
-          const url2 = new URL(r1.headers.get('location'), `${MOODLE_URL}/login/index.php`).toString();
-          const r2 = await fetch(url2, { redirect: 'manual', headers: hdrs });
-          info.s2 = { url: url2, status: r2.status, location: r2.headers.get('location') };
-
-          // Schritt 3
-          if (r2.status >= 300 && r2.status < 400 && r2.headers.get('location')) {
-            const rawLoc3 = r2.headers.get('location');
-            let url3;
-            try { url3 = new URL(rawLoc3, url2).toString(); } catch(e) { info.s3parseError = `"${rawLoc3}" → ${e.message}`; }
-            if (url3) {
-              const r3 = await fetch(url3, { redirect: 'manual', headers: hdrs });
-              info.s3 = { url: url3.slice(0, 200), status: r3.status, location: r3.headers.get('location')?.slice(0, 200) };
-            }
-          }
-        }
-      } catch(e) { info.error = e.message; }
-      return Response.json({ ok: true, info });
     }
 
     // ── GET /moodle/colo – wo läuft der Worker + Moodle-Reachability-Test ────
