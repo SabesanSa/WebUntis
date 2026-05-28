@@ -82,6 +82,31 @@ function decodeEntities(str) {
 
 // ── proxyFetch – fetch() mit manuellem Redirect-Follow und CookieJar ──────────
 
+// Einzelner Fetch mit Timeout (AbortController) und Retry bei 5xx/522/Timeout.
+// Schul-Infrastruktur (Cloudflare-Origin) liefert sporadisch 522 – das fangen wir hier ab.
+async function fetchWithTimeout(url, options, timeoutMs = 10_000, retries = 2) {
+  let lastErr;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    const ctrl  = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const resp = await fetch(url, { ...options, signal: ctrl.signal });
+      clearTimeout(timer);
+      // Cloudflare-Origin-Fehler (520–527, 502/503/504) → kurz warten & erneut
+      if (resp.status >= 520 || resp.status === 502 || resp.status === 503 || resp.status === 504) {
+        lastErr = new Error(`HTTP ${resp.status} (vorübergehend)`);
+        if (attempt < retries) { await new Promise(r => setTimeout(r, 1000 * attempt)); continue; }
+      }
+      return resp;
+    } catch (e) {
+      clearTimeout(timer);
+      lastErr = e;
+      if (attempt < retries) await new Promise(r => setTimeout(r, 1000 * attempt));
+    }
+  }
+  throw lastErr ?? new Error('fetchWithTimeout fehlgeschlagen');
+}
+
 async function proxyFetch(jar, url, method = 'GET', extraHeaders = {}, body = null, maxRedirects = 15) {
   let currentUrl    = url;
   let currentMethod = method;
@@ -100,7 +125,7 @@ async function proxyFetch(jar, url, method = 'GET', extraHeaders = {}, body = nu
     const headers   = { ...baseHeaders, ...extraHeaders };
     if (cookieStr) headers['Cookie'] = cookieStr;
 
-    const resp = await fetch(currentUrl, {
+    const resp = await fetchWithTimeout(currentUrl, {
       method:   currentMethod,
       headers,
       body:     currentBody || undefined,
@@ -227,7 +252,7 @@ async function doLogineoLogin(env) {
 
 // ── Login mit Retry (Logineo-SSO ist flaky – etabliert Session nicht immer sofort) ──
 
-async function doLogineoLoginWithRetry(env, maxAttempts = 4) {
+async function doLogineoLoginWithRetry(env, maxAttempts = 2) {
   let lastErr;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
@@ -353,7 +378,7 @@ async function handleMoodleRequest(request, env, url) {
       const { methodname, args } = await request.json();
 
       const callAjax = async (session) => {
-        const resp = await fetch(
+        const resp = await fetchWithTimeout(
           `${MOODLE_URL}/lib/ajax/service.php?sesskey=${session.sesskey}&info=${methodname}`,
           {
             method:  'POST',
@@ -361,7 +386,10 @@ async function handleMoodleRequest(request, env, url) {
             body:    JSON.stringify([{ index: 0, methodname, args }]),
           }
         );
-        const result = await resp.json();
+        const text = await resp.text();
+        let result;
+        try { result = JSON.parse(text); }
+        catch { throw new Error(`Moodle antwortete nicht mit JSON (HTTP ${resp.status}): ${text.slice(0, 80)}`); }
         return result?.[0];
       };
 
@@ -394,12 +422,14 @@ async function handleMoodleRequest(request, env, url) {
         form.append('moodlewsrestformat', 'json');
         flattenParams(params ?? {}, form);
 
-        const resp = await fetch(`${MOODLE_URL}/webservice/rest/server.php`, {
+        const resp = await fetchWithTimeout(`${MOODLE_URL}/webservice/rest/server.php`, {
           method:  'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Cookie': session.cookie, 'User-Agent': 'Mozilla/5.0' },
           body:    form,
         });
-        return resp.json();
+        const text = await resp.text();
+        try { return JSON.parse(text); }
+        catch { throw new Error(`Moodle antwortete nicht mit JSON (HTTP ${resp.status}): ${text.slice(0, 80)}`); }
       };
 
       let session = await getOrCreateSession(env);
@@ -424,9 +454,9 @@ async function handleMoodleRequest(request, env, url) {
 
       const dlUrl = fileUrl.replace('/webservice/pluginfile.php/', '/pluginfile.php/').split('?')[0];
 
-      const resp = await fetch(dlUrl, {
+      const resp = await fetchWithTimeout(dlUrl, {
         headers: { 'Cookie': session.cookie, 'User-Agent': 'Mozilla/5.0' },
-      });
+      }, 25_000, 3);
       if (!resp.ok) return Response.json({ ok: false, error: `Download ${resp.status}` }, { status: 502 });
 
       const buffer      = await resp.arrayBuffer();
