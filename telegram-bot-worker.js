@@ -225,6 +225,22 @@ async function doLogineoLogin(env) {
   return { sesskey, userId, cookie: jar.getCookieString(MOODLE_URL) };
 }
 
+// ── Login mit Retry (Logineo-SSO ist flaky – etabliert Session nicht immer sofort) ──
+
+async function doLogineoLoginWithRetry(env, maxAttempts = 4) {
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await doLogineoLogin(env);
+    } catch (e) {
+      lastErr = e;
+      console.log(`[Moodle] ⚠️  Login-Versuch ${attempt}/${maxAttempts} fehlgeschlagen: ${e.message}`);
+      if (attempt < maxAttempts) await new Promise(r => setTimeout(r, 800));
+    }
+  }
+  throw lastErr ?? new Error('[Login] Fehlgeschlagen nach mehreren Versuchen');
+}
+
 // ── KV-Session-Cache ──────────────────────────────────────────────────────────
 
 async function getOrCreateSession(env) {
@@ -233,7 +249,7 @@ async function getOrCreateSession(env) {
     if (cached?.sesskey && cached?.expiry > Date.now()) return cached;
   }
 
-  const session = await doLogineoLogin(env);
+  const session = await doLogineoLoginWithRetry(env);
   session.expiry = Date.now() + 28 * 60 * 1000;
 
   if (env.MOODLE_KV) {
@@ -326,7 +342,7 @@ async function handleMoodleRequest(request, env, url) {
     // ── POST /moodle/login (erzwingt neuen Login, löscht KV-Cache) ───────────
     if (path === '/moodle/login') {
       if (env.MOODLE_KV) await env.MOODLE_KV.delete('session');
-      const session = await doLogineoLogin(env);
+      const session = await doLogineoLoginWithRetry(env);
       const s = { sesskey: session.sesskey, userId: session.userId, cookie: session.cookie, expiry: Date.now() + 28*60*1000 };
       if (env.MOODLE_KV) await env.MOODLE_KV.put('session', JSON.stringify(s), { expirationTtl: 1800 });
       return Response.json({ ok: true, sesskey: session.sesskey, userId: session.userId });
@@ -334,23 +350,34 @@ async function handleMoodleRequest(request, env, url) {
 
     // ── POST /moodle/ajax ────────────────────────────────────────────────────
     if (path === '/moodle/ajax') {
-      const session = await getOrCreateSession(env);
       const { methodname, args } = await request.json();
 
-      const resp = await fetch(
-        `${MOODLE_URL}/lib/ajax/service.php?sesskey=${session.sesskey}&info=${methodname}`,
-        {
-          method:  'POST',
-          headers: { 'Content-Type': 'application/json', 'Cookie': session.cookie, 'X-Requested-With': 'XMLHttpRequest', 'User-Agent': 'Mozilla/5.0' },
-          body:    JSON.stringify([{ index: 0, methodname, args }]),
-        }
-      );
-      const result = await resp.json();
-      const item   = result?.[0];
+      const callAjax = async (session) => {
+        const resp = await fetch(
+          `${MOODLE_URL}/lib/ajax/service.php?sesskey=${session.sesskey}&info=${methodname}`,
+          {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json', 'Cookie': session.cookie, 'X-Requested-With': 'XMLHttpRequest', 'User-Agent': 'Mozilla/5.0' },
+            body:    JSON.stringify([{ index: 0, methodname, args }]),
+          }
+        );
+        const result = await resp.json();
+        return result?.[0];
+      };
+
+      let session = await getOrCreateSession(env);
+      let item    = await callAjax(session);
+
+      // Session abgelaufen? → einmal frisch einloggen und erneut versuchen
+      if (item?.error) {
+        if (env.MOODLE_KV) await env.MOODLE_KV.delete('session');
+        session = await getOrCreateSession(env);
+        item    = await callAjax(session);
+      }
 
       if (!item) return Response.json({ ok: false, error: 'Leere AJAX-Antwort' }, { status: 502 });
       if (item.error) {
-        if (env.MOODLE_KV) await env.MOODLE_KV.delete('session'); // Session abgelaufen
+        if (env.MOODLE_KV) await env.MOODLE_KV.delete('session');
         return Response.json({ ok: false, error: `AJAX: ${JSON.stringify(item.exception)}`, sessionExpired: true }, { status: 401 });
       }
       return Response.json({ ok: true, data: item.data });
@@ -358,21 +385,33 @@ async function handleMoodleRequest(request, env, url) {
 
     // ── POST /moodle/rest ────────────────────────────────────────────────────
     if (path === '/moodle/rest') {
-      const session = await getOrCreateSession(env);
       const { wsfunction, params } = await request.json();
 
-      const form = new URLSearchParams();
-      form.append('sesskey', session.sesskey);
-      form.append('wsfunction', wsfunction);
-      form.append('moodlewsrestformat', 'json');
-      flattenParams(params ?? {}, form);
+      const callRest = async (session) => {
+        const form = new URLSearchParams();
+        form.append('sesskey', session.sesskey);
+        form.append('wsfunction', wsfunction);
+        form.append('moodlewsrestformat', 'json');
+        flattenParams(params ?? {}, form);
 
-      const resp = await fetch(`${MOODLE_URL}/webservice/rest/server.php`, {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Cookie': session.cookie, 'User-Agent': 'Mozilla/5.0' },
-        body:    form,
-      });
-      const data = await resp.json();
+        const resp = await fetch(`${MOODLE_URL}/webservice/rest/server.php`, {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Cookie': session.cookie, 'User-Agent': 'Mozilla/5.0' },
+          body:    form,
+        });
+        return resp.json();
+      };
+
+      let session = await getOrCreateSession(env);
+      let data    = await callRest(session);
+
+      // Session abgelaufen? → einmal frisch einloggen und erneut versuchen
+      if (data?.exception && /token|session|login|invalidsesskey/i.test(`${data.errorcode ?? ''}${data.exception ?? ''}`)) {
+        if (env.MOODLE_KV) await env.MOODLE_KV.delete('session');
+        session = await getOrCreateSession(env);
+        data    = await callRest(session);
+      }
+
       if (data?.exception) return Response.json({ ok: false, error: data.message ?? 'REST-Fehler' }, { status: 502 });
       return Response.json({ ok: true, data });
     }
