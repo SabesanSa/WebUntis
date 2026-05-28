@@ -7,7 +7,7 @@ compatibility_date = "2025-01-01"
 # Die ausgegebene ID hier eintragen.
 [[kv_namespaces]]
 binding = "MOODLE_KV"
-id = "PLACEHOLDER_KV_ID"
+id = "4af93a5a16cd4daa92e3bfdc64d47878"
 
 # Öffentliche Variablen (kein Geheimnis)
 [vars]

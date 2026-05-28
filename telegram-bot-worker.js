@@ -76,7 +76,8 @@ function decodeEntities(str) {
   return (str ?? '')
     .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
-    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n));
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => String.fromCharCode(parseInt(n, 16))) // hex: &#x2f; → /
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n));                        // dezimal: &#47; → /
 }
 
 // ── proxyFetch – fetch() mit manuellem Redirect-Follow und CookieJar ──────────
@@ -196,8 +197,10 @@ async function doLogineoLogin(env) {
 
   const samlResponse = samlM[1];
   const relayState   = decodeEntities(relayM?.[1] ?? '');
-  const acsUrl       = decodeEntities(acsM?.[1] ?? '');
-  if (!acsUrl) throw new Error('[Login] ACS-URL nicht gefunden');
+  const acsRaw       = decodeEntities(acsM?.[1] ?? '');
+  if (!acsRaw) throw new Error('[Login] ACS-URL nicht gefunden');
+  // ACS-URL absolut machen (falls relativ, r2.url = IdP-Seite als Base verwenden)
+  const acsUrl = acsRaw.startsWith('http') ? acsRaw : new URL(acsRaw, r2.url).toString();
 
   // Schritt 3: SAMLResponse an Moodle ACS
   const r3 = await proxyFetch(jar, acsUrl, 'POST', {
@@ -284,13 +287,48 @@ async function handleMoodleRequest(request, env, url) {
   try {
     // ── GET /moodle/health ───────────────────────────────────────────────────
     if (path === '/moodle/health') {
-      return Response.json({ ok: true, moodle: !!MOODLE_URL });
+      return Response.json({
+        ok: true, moodle: !!MOODLE_URL,
+        hasUsername: !!env.MOODLE_USERNAME, hasPassword: !!env.MOODLE_PASSWORD,
+      });
+    }
+
+    // ── GET /moodle/debug – Redirect-Kette bis zum IdP-Formular ─────────────
+    if (path === '/moodle/debug') {
+      const info = { moodleUrl: MOODLE_URL, hasUsername: !!env.MOODLE_USERNAME, hasPassword: !!env.MOODLE_PASSWORD };
+      const hdrs = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', 'Accept': 'text/html,*/*' };
+      try {
+        // Schritt 1
+        const r1 = await fetch(`${MOODLE_URL}/login/index.php`, { redirect: 'manual', headers: hdrs });
+        info.s1 = { status: r1.status, location: r1.headers.get('location') };
+
+        // Schritt 2 – folge dem Redirect manuell
+        if (r1.status >= 300 && r1.status < 400 && r1.headers.get('location')) {
+          const url2 = new URL(r1.headers.get('location'), `${MOODLE_URL}/login/index.php`).toString();
+          const r2 = await fetch(url2, { redirect: 'manual', headers: hdrs });
+          info.s2 = { url: url2, status: r2.status, location: r2.headers.get('location') };
+
+          // Schritt 3
+          if (r2.status >= 300 && r2.status < 400 && r2.headers.get('location')) {
+            const rawLoc3 = r2.headers.get('location');
+            let url3;
+            try { url3 = new URL(rawLoc3, url2).toString(); } catch(e) { info.s3parseError = `"${rawLoc3}" → ${e.message}`; }
+            if (url3) {
+              const r3 = await fetch(url3, { redirect: 'manual', headers: hdrs });
+              info.s3 = { url: url3.slice(0, 200), status: r3.status, location: r3.headers.get('location')?.slice(0, 200) };
+            }
+          }
+        }
+      } catch(e) { info.error = e.message; }
+      return Response.json({ ok: true, info });
     }
 
     // ── POST /moodle/login (erzwingt neuen Login, löscht KV-Cache) ───────────
     if (path === '/moodle/login') {
       if (env.MOODLE_KV) await env.MOODLE_KV.delete('session');
-      const session = await getOrCreateSession(env);
+      const session = await doLogineoLogin(env);
+      const s = { sesskey: session.sesskey, userId: session.userId, cookie: session.cookie, expiry: Date.now() + 28*60*1000 };
+      if (env.MOODLE_KV) await env.MOODLE_KV.put('session', JSON.stringify(s), { expirationTtl: 1800 });
       return Response.json({ ok: true, sesskey: session.sesskey, userId: session.userId });
     }
 
