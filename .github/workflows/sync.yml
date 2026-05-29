@@ -1,8 +1,7 @@
 name: Stundenplan Sync
 
 on:
-  schedule:
-    - cron: "0 5 * * *"
+  # Cron deaktiviert – Stundenplan läuft jetzt direkt über WebUntis (Railway), nicht mehr über Notion. Nur noch manuell.
   workflow_dispatch:
 
 jobs:
