@@ -1,11 +1,7 @@
 name: Moodle Check
 
 on:
-  schedule:
-    - cron: '0 6 * * 1-5'    # Mo–Fr 07:00 Berlin (MESZ)
-    - cron: '0 11 * * 1-5'   # Mo–Fr 12:00 Berlin (MESZ)
-    - cron: '0 8 * * 6,0'    # Sa+So 09:00 Berlin (MESZ) / 10:00 (MEZ)
-    - cron: '0 13 * * 6,0'   # Sa+So 14:00 Berlin (MESZ) / 15:00 (MEZ)
+  # Cron deaktiviert – ersetzt durch Railway-Drive-Sync (täglich 16:00). Nur noch manuell.
   workflow_dispatch:
 
 jobs:

@@ -1,9 +1,7 @@
 name: 📅 Wochenausblick
 
 on:
-  schedule:
-    - cron: "0 17 * * 0"   # 19:00 Uhr MESZ (Sommer, UTC+2)
-    - cron: "0 18 * * 0"   # 19:00 Uhr MEZ  (Winter, UTC+1)
+  # Cron deaktiviert – Wochencheck läuft jetzt über Claude/Railway. Nur noch manuell.
   workflow_dispatch:
     inputs:
       woche:

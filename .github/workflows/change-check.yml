@@ -1,12 +1,7 @@
 name: 📢 Stundenplan-Änderungen
 
 on:
-  schedule:
-    # Täglich nach dem Stundenplan-Sync (sync.yml läuft 05:00 UTC)
-    - cron: "30 5 * * *"    # 07:30 Berlin – direkt nach Sync
-
-    # Zusätzlicher Mittags-Check (fängt Änderungen aus dem Tagesverlauf)
-    - cron: "0 11 * * 1-5"  # 13:00 Berlin (Werktage)
+  # Cron deaktiviert – ersetzt durch Railway-Vertretungs-Wächter (jede Min). Nur noch manuell.
   workflow_dispatch:
 
 jobs:
