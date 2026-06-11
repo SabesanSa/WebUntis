@@ -81,13 +81,29 @@ async function checkFerien() {
   return { inFerien: false, letzterTag: false, name: null };
 }
 
+// Lädt ALLE Seiten (Pagination) – sonst fehlen ab 100 Zeilen still Einträge
 async function notionQuery(dbId, filter) {
-  const payload = filter ? { filter } : {};
-  const res = await post('api.notion.com', `/v1/databases/${dbId}/query`, payload, {
-    'Authorization': `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28'
-  });
-  if (res.object === 'error') throw new Error(res.message);
-  return res.results || [];
+  const results = [];
+  let cursor = null;
+  do {
+    const payload = { page_size: 100 };
+    if (filter) payload.filter = filter;
+    if (cursor) payload.start_cursor = cursor;
+    const res = await post('api.notion.com', `/v1/databases/${dbId}/query`, payload, {
+      'Authorization': `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28'
+    });
+    if (res.object === 'error') throw new Error(res.message);
+    if (typeof res !== 'object' || !Array.isArray(res.results)) throw new Error('Unerwartete Notion-Antwort: ' + String(res).slice(0, 120));
+    results.push(...res.results);
+    cursor = res.has_more ? res.next_cursor : null;
+  } while (cursor);
+  return results;
+}
+
+// HTML-Sonderzeichen escapen – Titel aus Notion/Kalender können <, >, & enthalten,
+// womit Telegram (parse_mode HTML) sonst die ganze Nachricht mit 400 ablehnt.
+function escapeHtml(s) {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 async function getStundenplan() {
@@ -108,7 +124,7 @@ async function getTodos() {
   return rows
     .map(page => {
       const p = page.properties;
-      return { title: p['Aufgabe']?.title?.[0]?.plain_text || '', prioritaet: p['Priorität']?.select?.name || '', faellig: p['Fällig']?.date?.start || '' };
+      return { title: p['Aufgabe']?.title?.[0]?.plain_text || '', prioritaet: p['Priorität']?.select?.name || '', faellig: (p['Fällig']?.date?.start || '').split('T')[0] };
     })
     .filter(t => t.title.length > 0)
     .sort((a, b) => {
@@ -137,10 +153,21 @@ async function getAccessToken() {
   return token.access_token;
 }
 
+// Korrekten UTC-Offset für Berlin am jeweiligen Datum ermitteln (Sommer +02, Winter +01).
+// Ein hartes +02:00 verschiebt das Abfragefenster im Winter um eine Stunde.
+function getBerlinOffset(datum) {
+  const d = new Date(datum + 'T12:00:00Z');
+  const berlinTime = new Date(d.toLocaleString('en-US', { timeZone: 'Europe/Berlin' }));
+  const utcTime = new Date(d.toLocaleString('en-US', { timeZone: 'UTC' }));
+  const offset = Math.round((berlinTime - utcTime) / 3600000);
+  return offset === 2 ? '+02:00' : '+01:00';
+}
+
 async function getKalenderTermine(datum, accessToken) {
+  const offset = getBerlinOffset(datum);
   const calId = encodeURIComponent('sabesis@web.de');
-  const start = encodeURIComponent(datum + 'T00:00:00+02:00');
-  const end   = encodeURIComponent(datum + 'T23:59:59+02:00');
+  const start = encodeURIComponent(`${datum}T00:00:00${offset}`);
+  const end   = encodeURIComponent(`${datum}T23:59:59${offset}`);
   const path  = `/calendar/v3/calendars/${calId}/events?timeMin=${start}&timeMax=${end}&singleEvents=true&orderBy=startTime`;
   const res = await get('www.googleapis.com', path, { 'Authorization': `Bearer ${accessToken}` });
   if (res.error) { console.error('Kalender Fehler:', JSON.stringify(res.error)); return []; }
@@ -188,7 +215,7 @@ async function main() {
   ]);
 
   let msg = `🎒 <b>Schul-Check – ${formatDate()}</b>\n`;
-  if (ferien.letzterTag) msg += `🏖️ <i>Letzter Ferientag (${ferien.name}) – morgen geht's wieder los!</i>\n`;
+  if (ferien.letzterTag) msg += `🏖️ <i>Letzter Ferientag (${escapeHtml(ferien.name)}) – morgen geht's wieder los!</i>\n`;
   msg += '\n';
 
   if (w) {
@@ -201,8 +228,8 @@ async function main() {
   } else {
     for (const s of stunden) {
       const emoji = s.status.includes('Ausfall') ? '❌' : s.status.includes('Vertretung') ? '🔄' : '✅';
-      msg += `${emoji} <b>${s.start}–${s.ende}</b> ${s.fach}`;
-      if (s.raum) msg += ` · ${s.raum}`;
+      msg += `${emoji} <b>${s.start}–${s.ende}</b> ${escapeHtml(s.fach)}`;
+      if (s.raum) msg += ` · ${escapeHtml(s.raum)}`;
       if (s.status.includes('Ausfall')) msg += ` <i>(Ausfall)</i>`;
       else if (s.status.includes('Vertretung')) msg += ` <i>(Vertretung)</i>`;
       msg += '\n';
@@ -214,8 +241,8 @@ async function main() {
     msg += `✨ Keine Termine heute\n`;
   } else {
     for (const t of termine) {
-      if (t.ganztag) msg += `🗓 ${t.titel} <i>(ganztägig)</i>\n`;
-      else msg += `🗓 <b>${t.start}–${t.ende}</b> ${t.titel}\n`;
+      if (t.ganztag) msg += `🗓 ${escapeHtml(t.titel)} <i>(ganztägig)</i>\n`;
+      else msg += `🗓 <b>${t.start}–${t.ende}</b> ${escapeHtml(t.titel)}\n`;
     }
   }
 
@@ -225,8 +252,8 @@ async function main() {
   } else {
     const pEmoji = { 'Hoch': '🔴', 'Mittel': '🟡', 'Niedrig': '🟢' };
     for (const t of todos.slice(0, 20)) {
-      msg += `${pEmoji[t.prioritaet] || '•'} ${t.title}`;
-      if (t.faellig) { const d = new Date(t.faellig); msg += ` <i>(fällig ${d.getDate()}.${d.getMonth()+1}.)</i>`; }
+      msg += `${pEmoji[t.prioritaet] || '•'} ${escapeHtml(t.title)}`;
+      if (t.faellig) { const d = new Date(t.faellig + 'T12:00:00'); msg += ` <i>(fällig ${d.getDate()}.${d.getMonth()+1}.)</i>`; }
       msg += '\n';
     }
     if (todos.length > 20) msg += `… und ${todos.length - 20} weitere\n`;
@@ -234,7 +261,7 @@ async function main() {
 
   msg += `\n🏠 <b>Persönliche Aufgaben</b>\n`;
   if (personal.length === 0) msg += `🎉 Nichts zu erledigen!\n`;
-  else for (const t of personal) msg += `☐ ${t}\n`;
+  else for (const t of personal) msg += `☐ ${escapeHtml(t)}\n`;
 
   msg += `\n🚀 <i>Guten Schultag!</i>`;
 

@@ -1,6 +1,6 @@
 // Cloudflare Worker – Telegram Bot + Moodle-Proxy für Schul-Abfragen
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     // ── Moodle-Proxy-Routen (/moodle/*) ────────────────────────────────────────
@@ -10,6 +10,15 @@ export default {
 
     // ── Telegram-Bot ────────────────────────────────────────────────────────────
     if (request.method !== 'POST') return new Response('OK');
+
+    // Webhook-Secret prüfen (nur aktiv wenn das Secret gesetzt ist).
+    // Aktivieren mit:  wrangler secret put TELEGRAM_WEBHOOK_SECRET
+    // und setWebhook mit secret_token=<gleicher Wert> neu registrieren.
+    if (env.TELEGRAM_WEBHOOK_SECRET) {
+      const token = request.headers.get('x-telegram-bot-api-secret-token') ?? '';
+      if (token !== env.TELEGRAM_WEBHOOK_SECRET) return new Response('OK');
+    }
+
     try {
       const body = await request.json();
       const message = body.message || body.edited_message;
@@ -17,7 +26,9 @@ export default {
       const chatId = String(message.chat.id);
       const text   = message.text.trim();
       if (chatId !== String(env.TELEGRAM_CHAT_ID)) return new Response('OK');
-      await handleNachricht(env, chatId, text);
+      // Sofort 200 zurückgeben, Verarbeitung im Hintergrund – sonst wiederholt
+      // Telegram das Update bei langsamer Antwort (→ doppelte Nachrichten)
+      ctx.waitUntil(handleNachricht(env, chatId, text).catch(e => console.error('Worker-Fehler:', e)));
     } catch (e) {
       console.error('Worker-Fehler:', e);
     }
@@ -354,8 +365,20 @@ async function moodleAjaxRaw(MOODLE_URL, session, methodname, args) {
   catch { throw new Error(`Moodle antwortete nicht mit JSON (HTTP ${resp.status})`); }
   const item = result?.[0];
   if (!item) throw new Error('Leere AJAX-Antwort');
-  if (item.error) { const e = new Error(`AJAX: ${JSON.stringify(item.exception)}`); e.sessionExpired = true; throw e; }
+  if (item.error) {
+    const e = new Error(`AJAX: ${JSON.stringify(item.exception)}`);
+    e.sessionExpired = istSessionFehler(item);
+    throw e;
+  }
   return item.data;
+}
+
+// Unterscheidet abgelaufene Session von echten API-Fehlern (falsche Argumente etc.),
+// damit nicht jeder Fehler einen frischen Logineo-Login auslöst (SSO ist flaky).
+function istSessionFehler(item) {
+  if (!item?.error) return false;
+  const info = JSON.stringify(item.exception ?? item.error ?? '');
+  return /sesskey|session|login|loggedoff/i.test(info);
 }
 
 function fileNameFromUrl(u) {
@@ -532,7 +555,7 @@ async function handleMoodleOp(request, env, url) {
       let item    = await callAjax(session);
 
       // Session abgelaufen? → einmal frisch einloggen und erneut versuchen
-      if (item?.error) {
+      if (istSessionFehler(item)) {
         if (env.MOODLE_KV) await env.MOODLE_KV.delete('session');
         session = await getOrCreateSession(env);
         item    = await callAjax(session);
@@ -540,8 +563,10 @@ async function handleMoodleOp(request, env, url) {
 
       if (!item) return Response.json({ ok: false, error: 'Leere AJAX-Antwort' }, { status: 502 });
       if (item.error) {
-        if (env.MOODLE_KV) await env.MOODLE_KV.delete('session');
-        return Response.json({ ok: false, error: `AJAX: ${JSON.stringify(item.exception)}`, sessionExpired: true }, { status: 401 });
+        // Frische Session NICHT löschen – ein echter API-Fehler (falsche Argumente
+        // etc.) heißt nicht, dass die Session ungültig ist.
+        const expired = istSessionFehler(item);
+        return Response.json({ ok: false, error: `AJAX: ${JSON.stringify(item.exception)}`, sessionExpired: expired }, { status: expired ? 401 : 502 });
       }
       return Response.json({ ok: true, data: item.data });
     }
@@ -668,10 +693,10 @@ async function handleNachricht(env, chatId, text) {
 
 
   if (t === 'moodle' || t === '/moodle') {
-    const ok = await setzeMoodleTrigger(env);
-    await sendeTelegram(env, chatId, ok
-      ? '📚 Moodle-Check wird gestartet – Dateien landen in ~1 Minute in Drive!'
-      : '❌ Moodle-Trigger konnte nicht gesetzt werden.');
+    // Der frühere GitHub-Datei-Trigger hat keinen Konsumenten mehr – der
+    // Drive-Sync läuft automatisch auf Railway (alle 15 Min, 6–22 Uhr).
+    await sendeTelegram(env, chatId,
+      '📚 Der Moodle-Drive-Sync läuft automatisch alle 15 Minuten (6–22 Uhr).\nNeue Dateien werden dir von selbst per Telegram gemeldet – spätestens ~15 Min nach dem Upload.');
     return;
   }
 
@@ -733,8 +758,12 @@ function parseDatum(t) {
   }
   const match = t.match(/^(\d{1,2})\.(\d{1,2})\.?(\d{4})?$/);
   if (match) {
-    const d = new Date(match[3] ? parseInt(match[3]) : heute.getFullYear(), parseInt(match[2]) - 1, parseInt(match[1]));
-    if (!isNaN(d.getTime())) return fmt(d);
+    const tag   = parseInt(match[1]);
+    const monat = parseInt(match[2]);
+    const jahr  = match[3] ? parseInt(match[3]) : heute.getFullYear();
+    const d = new Date(jahr, monat - 1, tag);
+    // JS rollt ungültige Daten still über (31.6. → 1.7.) – das fangen wir ab
+    if (d.getMonth() === monat - 1 && d.getDate() === tag) return fmt(d);
   }
   return null;
 }
@@ -792,15 +821,29 @@ async function getWetterFuerDatum(datum) {
 // ── Notion ────────────────────────────────────────────────────────────────────
 
 async function notionQuery(env, dbId, filter) {
-  const payload = filter ? { filter, page_size: 100 } : { page_size: 100 };
-  const res = await fetch(`https://api.notion.com/v1/databases/${dbId}/query`, {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${env.NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
-  const data = await res.json();
-  if (data.object === 'error') throw new Error(data.message);
-  return data.results || [];
+  const results = [];
+  let cursor = null;
+  do {
+    const payload = { page_size: 100 };
+    if (filter) payload.filter = filter;
+    if (cursor) payload.start_cursor = cursor;
+    const res = await fetch(`https://api.notion.com/v1/databases/${dbId}/query`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${env.NOTION_TOKEN}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json();
+    if (data.object === 'error') throw new Error(data.message);
+    results.push(...(data.results || []));
+    cursor = data.has_more ? data.next_cursor : null;
+  } while (cursor);
+  return results;
+}
+
+// HTML-Sonderzeichen escapen – Titel aus Notion/Kalender können <, >, & enthalten,
+// womit Telegram (parse_mode HTML) sonst die ganze Nachricht mit 400 ablehnt.
+function escapeHtml(s) {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 const IGNORIEREN = ['AG Bienen', 'Vertiefung'];
@@ -827,6 +870,8 @@ async function sendeTagesansicht(env, chatId, datum) {
       .filter(s => !IGNORIEREN.includes(s.fach))
       .sort((a, b) => a.start.localeCompare(b.start));
 
+    for (const s of stunden) { s.fach = escapeHtml(s.fach); s.raum = escapeHtml(s.raum); }
+
     let msg = `📚 <b>Stundenplan – ${formatAnzeige(datum)}</b>\n`;
     if (wetter) msg += `${wetter.emoji} ↑${wetter.max}° ↓${wetter.min}° · 💧 ${wetter.rain} mm\n`;
     msg += '\n';
@@ -848,8 +893,8 @@ async function sendeTagesansicht(env, chatId, datum) {
     msg += `\n📅 <b>Termine</b>\n`;
     if (termine.length === 0) msg += `✨ Keine Termine\n`;
     else for (const t of termine) {
-      if (t.ganztag) msg += `🗓 ${t.titel} <i>(ganztägig)</i>\n`;
-      else msg += `🗓 <b>${t.start}–${t.ende}</b> ${t.titel}\n`;
+      if (t.ganztag) msg += `🗓 ${escapeHtml(t.titel)} <i>(ganztägig)</i>\n`;
+      else msg += `🗓 <b>${t.start}–${t.ende}</b> ${escapeHtml(t.titel)}\n`;
     }
 
     msg += `\n✅ <b>Offene Schulaufgaben</b>\n`;
@@ -857,7 +902,7 @@ async function sendeTagesansicht(env, chatId, datum) {
     else {
       const pEmoji = { 'Hoch': '🔴', 'Mittel': '🟡', 'Niedrig': '🟢' };
       for (const t of schulTodos.slice(0, 10)) {
-        msg += `${pEmoji[t.prioritaet] || '•'} ${t.title}`;
+        msg += `${pEmoji[t.prioritaet] || '•'} ${escapeHtml(t.title)}`;
         if (t.faellig) { const d = new Date(t.faellig + 'T12:00:00'); msg += ` <i>(${d.getDate()}.${d.getMonth()+1}.)</i>`; }
         msg += '\n';
       }
@@ -866,7 +911,7 @@ async function sendeTagesansicht(env, chatId, datum) {
 
     msg += `\n🏠 <b>Persönliche Aufgaben</b>\n`;
     if (personalTodos.length === 0) msg += `🎉 Nichts zu erledigen!\n`;
-    else for (const t of personalTodos) msg += `☐ ${t}\n`;
+    else for (const t of personalTodos) msg += `☐ ${escapeHtml(t)}\n`;
 
     await sendeTelegramLang(env, chatId, msg);
   } catch(e) {
@@ -882,7 +927,7 @@ async function getSchulTodosRaw(env) {
   const rows = await notionQuery(env, env.NOTION_TODO_DATABASE_ID, { property: 'Status', select: { does_not_equal: 'Erledigt' } });
   const pOrder = { 'Hoch': 0, 'Mittel': 1, 'Niedrig': 2, '': 3 };
   return rows
-    .map(p => ({ title: p.properties['Aufgabe']?.title?.[0]?.plain_text || '', prioritaet: p.properties['Priorität']?.select?.name || '', faellig: p.properties['Fällig']?.date?.start || '' }))
+    .map(p => ({ title: p.properties['Aufgabe']?.title?.[0]?.plain_text || '', prioritaet: p.properties['Priorität']?.select?.name || '', faellig: (p.properties['Fällig']?.date?.start || '').split('T')[0] }))
     .filter(t => t.title)
     .sort((a, b) => {
       if (a.faellig && b.faellig) return a.faellig.localeCompare(b.faellig);
@@ -905,13 +950,13 @@ async function sendeSchulaufgaben(env, chatId) {
     else {
       const pEmoji = { 'Hoch': '🔴', 'Mittel': '🟡', 'Niedrig': '🟢' };
       for (const t of todos.slice(0, 20)) {
-        msg += `${pEmoji[t.prioritaet] || '•'} ${t.title}`;
+        msg += `${pEmoji[t.prioritaet] || '•'} ${escapeHtml(t.title)}`;
         if (t.faellig) { const d = new Date(t.faellig + 'T12:00:00'); msg += ` <i>(${d.getDate()}.${d.getMonth()+1}.)</i>`; }
         msg += '\n';
       }
       if (todos.length > 20) msg += `… und ${todos.length - 20} weitere`;
     }
-    await sendeTelegram(env, chatId, msg);
+    await sendeTelegramLang(env, chatId, msg);
   } catch(e) { await sendeTelegram(env, chatId, '⚠️ Fehler beim Abrufen der Schulaufgaben.'); }
 }
 
@@ -920,19 +965,21 @@ async function sendePersoenlicheAufgaben(env, chatId) {
     const todos = await getPersonalTodosRaw(env);
     let msg = `🏠 <b>Persönliche Aufgaben</b>\n\n`;
     if (todos.length === 0) { msg += `🎉 Nichts zu erledigen!`; }
-    else for (const t of todos) msg += `☐ ${t}\n`;
-    await sendeTelegram(env, chatId, msg);
+    else for (const t of todos) msg += `☐ ${escapeHtml(t)}\n`;
+    await sendeTelegramLang(env, chatId, msg);
   } catch(e) { await sendeTelegram(env, chatId, '⚠️ Fehler beim Abrufen der persönlichen Aufgaben.'); }
 }
 
 // ── Telegram ──────────────────────────────────────────────────────────────────
 
 async function sendeTelegram(env, chatId, text) {
-  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+  const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML' })
   });
+  const data = await res.json().catch(() => null);
+  if (!data?.ok) console.error('Telegram-Fehler:', res.status, JSON.stringify(data)?.slice(0, 300));
 }
 
 async function sendeTelegramLang(env, chatId, text) {
@@ -969,39 +1016,8 @@ function hilfeText() {
 • <b>abendcheck</b> – Abend-Check jetzt ausführen
 • <b>wochencheck</b> – Wochencheck diese Woche
 • <b>nächste Woche</b> – Wochencheck nächste Woche
-• <b>moodle</b> – Moodle auf neue Dateien prüfen
+• <b>moodle</b> – Info zum automatischen Drive-Sync
 
 ❓ <b>hilfe</b> – diese Übersicht`;
 }
 
-// ── Moodle Trigger via GitHub ─────────────────────────────────────────────────
-
-async function setzeMoodleTrigger(env) {
-  const apiUrl = `https://api.github.com/repos/${env.GITHUB_USERNAME}/WebUntis/contents/moodle-trigger.json`;
-  const headers = {
-    'Authorization': `Bearer ${env.GITHUB_TOKEN}`,
-    'Accept': 'application/vnd.github+json',
-    'Content-Type': 'application/json',
-    'User-Agent': 'schul-bot'
-  };
-
-  // Aktuellen SHA holen
-  const get = await fetch(apiUrl, { headers });
-  if (!get.ok) return false;
-  const data = await get.json();
-  const sha  = data.sha;
-
-  // Trigger setzen
-  const inhalt  = JSON.stringify({ trigger: true });
-  const encoded = btoa(inhalt);
-  const put = await fetch(apiUrl, {
-    method: 'PUT',
-    headers,
-    body: JSON.stringify({
-      message: 'trigger=true',
-      content: encoded,
-      sha
-    })
-  });
-  return put.status === 200 || put.status === 201;
-}

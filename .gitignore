@@ -1,0 +1,11 @@
+# Abhängigkeiten
+node_modules/
+.wrangler/
+
+# Zugangsdaten (von test.py erwartet) – NIE committen
+config.json
+.env
+
+# Lokale Laufzeit-Artefakte (in CI über actions/cache verwaltet)
+stundenplan-snapshot.json
+moodle_known_files.json

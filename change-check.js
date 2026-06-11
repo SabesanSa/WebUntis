@@ -77,13 +77,24 @@ function horizont() {
 
 // ── Notion ────────────────────────────────────────────────────────────────────
 
+// Lädt ALLE Seiten (Pagination!) – 14 Tage Stundenplan können >100 Zeilen sein;
+// ohne Cursor-Schleife fehlen Einträge und es entstehen falsche Änderungs-Alerts.
 async function notionQuery(filter) {
-  const payload = filter ? { filter, page_size: 100 } : { page_size: 100 };
-  const res = await post('api.notion.com', `/v1/databases/${NOTION_STUNDENPLAN}/query`, payload, {
-    'Authorization': `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28'
-  });
-  if (res.object === 'error') throw new Error(res.message);
-  return res.results || [];
+  const results = [];
+  let cursor = null;
+  do {
+    const payload = { page_size: 100 };
+    if (filter) payload.filter = filter;
+    if (cursor) payload.start_cursor = cursor;
+    const res = await post('api.notion.com', `/v1/databases/${NOTION_STUNDENPLAN}/query`, payload, {
+      'Authorization': `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28'
+    });
+    if (res.object === 'error') throw new Error(res.message);
+    if (typeof res !== 'object' || !Array.isArray(res.results)) throw new Error('Unerwartete Notion-Antwort: ' + String(res).slice(0, 120));
+    results.push(...res.results);
+    cursor = res.has_more ? res.next_cursor : null;
+  } while (cursor);
+  return results;
 }
 
 // ── Aktuellen Stundenplan aus Notion laden (heute + nächste 14 Tage) ──────────
@@ -147,6 +158,12 @@ function statusEmoji(status) {
   return '✅';
 }
 
+// HTML-Sonderzeichen escapen – Fach-/Raumnamen können <, >, & enthalten,
+// womit Telegram (parse_mode HTML) sonst die ganze Nachricht ablehnt.
+function escapeHtml(s) {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 function vergleiche(altState, neuState) {
   const relevanteTimage = horizont();
   const aenderungen = [];
@@ -165,7 +182,7 @@ function vergleiche(altState, neuState) {
         // Stunde weggefallen
         aenderungen.push({
           datum, typ: 'entfernt',
-          text: `${statusEmoji('Ausfall')} ${formatDatum(datum)} ${alt.start} <b>${alt.fach}</b> weggefallen`
+          text: `${statusEmoji('Ausfall')} ${formatDatum(datum)} ${alt.start} <b>${escapeHtml(alt.fach)}</b> weggefallen`
         });
         continue;
       }
@@ -175,7 +192,7 @@ function vergleiche(altState, neuState) {
         const altWar = alt.status === 'Normal' ? 'regulär' : alt.status;
         aenderungen.push({
           datum, typ: 'status',
-          text: `${statusEmoji(neu.status)} ${formatDatum(datum)} ${alt.start} <b>${alt.fach}</b>: ${altWar} → <b>${neu.status}</b>`
+          text: `${statusEmoji(neu.status)} ${formatDatum(datum)} ${alt.start} <b>${escapeHtml(alt.fach)}</b>: ${altWar} → <b>${neu.status}</b>`
         });
       }
 
@@ -185,15 +202,16 @@ function vergleiche(altState, neuState) {
         const neuRaum = neu.raum || '?';
         aenderungen.push({
           datum, typ: 'raum',
-          text: `🏫 ${formatDatum(datum)} ${alt.start} <b>${alt.fach}</b>: Raum ${altRaum} → <b>${neuRaum}</b>`
+          text: `🏫 ${formatDatum(datum)} ${alt.start} <b>${escapeHtml(alt.fach)}</b>: Raum ${escapeHtml(altRaum)} → <b>${escapeHtml(neuRaum)}</b>`
         });
       }
 
-      // Uhrzeit geändert?
-      if (alt.start !== neu.start || alt.ende !== neu.ende) {
+      // Endzeit geändert? (Startzeit ist Teil des Vergleichs-Keys – eine geänderte
+      // Startzeit erscheint daher als "weggefallen" + "neu hinzugekommen")
+      if (alt.ende !== neu.ende) {
         aenderungen.push({
           datum, typ: 'zeit',
-          text: `⏰ ${formatDatum(datum)} <b>${alt.fach}</b>: ${alt.start}–${alt.ende} → <b>${neu.start}–${neu.ende}</b>`
+          text: `⏰ ${formatDatum(datum)} <b>${escapeHtml(alt.fach)}</b>: ${alt.start}–${alt.ende} → <b>${neu.start}–${neu.ende}</b>`
         });
       }
     }
@@ -213,7 +231,7 @@ function vergleiche(altState, neuState) {
       if (!altState[datum]) continue;
       aenderungen.push({
         datum, typ: 'neu',
-        text: `➕ ${formatDatum(datum)} ${neu.start} <b>${neu.fach}</b> neu hinzugekommen`
+        text: `➕ ${formatDatum(datum)} ${neu.start} <b>${escapeHtml(neu.fach)}</b> neu hinzugekommen`
       });
     }
   }

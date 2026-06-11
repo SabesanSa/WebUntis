@@ -70,13 +70,29 @@ function checkUhrzeit() {
 
 // ── Notion ────────────────────────────────────────────────────────────────────
 
+// Lädt ALLE Seiten (Pagination) – sonst fehlen ab 100 Zeilen still Einträge
 async function notionQuery(dbId, filter) {
-  const payload = filter ? { filter, page_size: 100 } : { page_size: 100 };
-  const res = await post('api.notion.com', `/v1/databases/${dbId}/query`, payload, {
-    'Authorization': `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28'
-  });
-  if (res.object === 'error') throw new Error(res.message);
-  return res.results || [];
+  const results = [];
+  let cursor = null;
+  do {
+    const payload = { page_size: 100 };
+    if (filter) payload.filter = filter;
+    if (cursor) payload.start_cursor = cursor;
+    const res = await post('api.notion.com', `/v1/databases/${dbId}/query`, payload, {
+      'Authorization': `Bearer ${NOTION_TOKEN}`, 'Notion-Version': '2022-06-28'
+    });
+    if (res.object === 'error') throw new Error(res.message);
+    if (typeof res !== 'object' || !Array.isArray(res.results)) throw new Error('Unerwartete Notion-Antwort: ' + String(res).slice(0, 120));
+    results.push(...res.results);
+    cursor = res.has_more ? res.next_cursor : null;
+  } while (cursor);
+  return results;
+}
+
+// HTML-Sonderzeichen escapen – Titel aus Notion können <, >, & enthalten,
+// womit Telegram (parse_mode HTML) sonst die ganze Nachricht mit 400 ablehnt.
+function escapeHtml(s) {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 // Einzelne Notion-Page laden (um den Titel einer Fach-Relation-Seite zu lesen)
@@ -135,7 +151,7 @@ async function getTodosGefiltert(morgenDatum, faecherMorgen) {
     const title    = p['Aufgabe']?.title?.[0]?.plain_text || '';
     if (!title) return null;
 
-    const faellig    = p['Fällig']?.date?.start || '';
+    const faellig    = (p['Fällig']?.date?.start || '').split('T')[0];
     const prioritaet = p['Priorität']?.select?.name || '';
 
     // Fach ist Relation → IDs auflösen
@@ -243,7 +259,7 @@ async function main() {
   if (stunden.length > 0) {
     const faecherListe = stunden.map(s => {
       const e = s.status === 'Ausfall' ? ' ❌' : s.status === 'Vertretung' ? ' 🔄' : '';
-      return `${s.fach}${e}`;
+      return `${escapeHtml(s.fach)}${e}`;
     }).join(' · ');
     msg += `<i>${faecherListe}</i>\n`;
   } else {
@@ -260,8 +276,8 @@ async function main() {
       let grund = '';
       if (t.istFaelligHeute)        grund = ` <b>⚠️ ÜBERFÄLLIG!</b>`;
       else if (t.istFaelligMorgen)  grund = ` <b>⚠️ morgen fällig!</b>`;
-      else if (t.istFachRelevant && t.fach) grund = ` <i>(${t.fach})</i>`;
-      msg += `${icon} ${t.title}${grund}\n`;
+      else if (t.istFachRelevant && t.fach) grund = ` <i>(${escapeHtml(t.fach)})</i>`;
+      msg += `${icon} ${escapeHtml(t.title)}${grund}\n`;
     }
   }
 
