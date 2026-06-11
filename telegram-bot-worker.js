@@ -619,6 +619,17 @@ async function handleMoodleOp(request, env, url) {
       }, 25_000, 3);
       if (!resp.ok) return Response.json({ ok: false, error: `Download ${resp.status}` }, { status: 502 });
 
+      // Zu große Dateien klar ablehnen statt am 128-MB-Worker-Limit zu sterben
+      // (Puffer + Base64 + JSON brauchen ein Mehrfaches der Dateigröße im RAM).
+      const MAX_BYTES = 25 * 1024 * 1024;
+      const len = Number(resp.headers.get('content-length') ?? 0);
+      if (len > MAX_BYTES) {
+        return Response.json({
+          ok: false, tooLarge: true,
+          error: `Datei zu groß für den Proxy (${Math.round(len / 1024 / 1024)} MB, max 25 MB)`,
+        }, { status: 413 });
+      }
+
       const buffer      = await resp.arrayBuffer();
       const base64      = arrayBufferToBase64(buffer);
       const contentType = resp.headers.get('content-type') ?? 'application/octet-stream';
